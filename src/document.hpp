@@ -103,7 +103,9 @@ class Document {
   // the zoom ratio as a fraction, e.g., 1.5 = 150%. rotation is the desired
   // rotation in clockwise degrees. For every rendered pixel, pw will be invoked
   // to store that pixel value somewhere.
-  virtual void Render(PixelWriter* pw, int page, float zoom, int rotation) = 0;
+  virtual void Render(PixelWriter* pw,
+      int page, float zoom, int rotation,
+      int clip_x, int clip_y, int clip_w, int clip_h) = 0;
 
   // Returns the outline of this document. The returned item represents the
   // top-level element in the outline, and is owned by the caller. If the
@@ -127,4 +129,3 @@ class Document {
 };
 
 #endif
-

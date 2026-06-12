@@ -83,6 +83,8 @@ struct State : public Viewer::State {
   } DocumentType;
   // Viewer render cache size.
   int RenderCacheSize;
+  // Maximum cache store size in bytes for MuPDF
+  int MuPDFStoreSize;
   // Input file.
   std::string FilePath;
   // Password for the input file. If no password is provided, this will be
@@ -111,6 +113,7 @@ struct State : public Viewer::State {
         Render(true),
         DocumentType(AUTO_DETECT),
         RenderCacheSize(Viewer::DEFAULT_RENDER_CACHE_SIZE),
+        MuPDFStoreSize(FitzDocument::DEFAULT_STORE_SIZE),
         FilePath(""),
         FilePassword(),
         FramebufferDevice(Framebuffer::DEFAULT_FRAMEBUFFER_DEVICE),
@@ -144,7 +147,7 @@ static bool LoadFile(State* state) {
 #if !defined(JFBVIEW_ENABLE_LEGACY_PDF_IMPL) && \
     !defined(JFBVIEW_ENABLE_LEGACY_IMAGE_IMPL)
   Document* doc =
-      FitzDocument::Open(state->FilePath, state->FilePassword.get());
+      FitzDocument::Open(state->FilePath, state->FilePassword.get(), state->MuPDFStoreSize);
 #else
   if (state->DocumentType == State::AUTO_DETECT) {
     if (GetFileExtension(state->FilePath) == "pdf") {
@@ -191,6 +194,7 @@ static bool LoadFile(State* state) {
     return false;
   }
   state->DocumentInst.reset(doc);
+  state->NumPages = state->DocumentInst->GetNumPages();
   return true;
 }
 
@@ -538,6 +542,7 @@ static const char* HELP_STRING =
     "\t                      huge documents, or if you just want to reduce\n"
     "\t                      memory usage, you might want to set this to a\n"
     "\t                      smaller number.\n"
+    "\t--store_size=N        Set MuPDF store size limit to N MB (default 32).\n"
     "\n"
     "jfbview home page: https://github.com/jichu4n/jfbview\n"
     "Bug reports & suggestions: https://github.com/jichu4n/jfbview/issues\n"
@@ -549,6 +554,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
   // Tags for long options that don't have short option chars.
   enum {
     RENDER_CACHE_SIZE = 0x1000,
+    STORE_SIZE,
     ZOOM_TO_WIDTH,
     ZOOM_TO_FIT,
     FB,
@@ -570,6 +576,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
       {"format", true, nullptr, 'f'},
       {"cache_size", true, nullptr, RENDER_CACHE_SIZE},
       {"fb_debug_info", false, nullptr, PRINT_FB_DEBUG_INFO_AND_EXIT},
+      {"store_size", true, nullptr, STORE_SIZE},
       {0, 0, 0, 0},
   };
   static const char* ShortFlags = "hP:p:z:r:c:f:";
@@ -610,6 +617,13 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
           exit(EXIT_FAILURE);
         }
         state->RenderCacheSize = std::max(1, state->RenderCacheSize + 1);
+        break;
+      case STORE_SIZE:
+        if (sscanf(optarg, "%d", &(state->MuPDFStoreSize)) < 0) {
+          fprintf(stderr, "Invalid MuPDF store size \"%s\"\n", optarg);
+          exit(EXIT_FAILURE);
+        }
+        state->MuPDFStoreSize = std::max(0, state->MuPDFStoreSize);
         break;
       case 'p':
         if (sscanf(optarg, "%d", &(state->Page)) < 1) {
@@ -731,6 +745,12 @@ std::unique_ptr<Registry> BuildRegistry() {
 
   registry->Register('I', std::make_unique<ToggleInvertedColorModeCommand>());
   registry->Register('S', std::make_unique<ToggleSepiaColorModeCommand>());
+
+  // MiSTer additions
+  registry->Register(27 /* Escape */, std::move(std::make_unique<ExitCommand>()));
+  registry->Register(KEY_ENTER, std::move(std::make_unique<PageDownCommand>()));
+  registry->Register('\r', std::move(std::make_unique<PageDownCommand>()));
+  registry->Register('\n', std::move(std::make_unique<PageDownCommand>()));
 
   return registry;
 }
@@ -901,15 +921,17 @@ int main(int argc, char* argv[]) {
   } while (!state.Exit);
 
   // 3. Clean up.
+  state.ViewerInst.reset();
+  state.SearchViewInst.reset();
   state.OutlineViewInst.reset();
   // Hack alert: Calling endwin() immediately after the framebuffer destructor
   // (which clears the screen) appears to cause a race condition where the next
   // shell prompt after this program exits would also get erased. Adding a
   // short sleep appears to fix the issue.
   state.FramebufferInst.reset();
+  state.DocumentInst.reset();
   usleep(100 * 1000);
   endwin();
 
   return EXIT_SUCCESS;
 }
-

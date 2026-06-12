@@ -22,6 +22,8 @@
 #ifndef FITZ_DOCUMENT_HPP
 #define FITZ_DOCUMENT_HPP
 
+#include <deque>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,19 +35,27 @@
 // Document implementation using Fitz.
 class FitzDocument : public Document {
  public:
+ enum {
+    DEFAULT_STORE_SIZE = 32,
+    DEFAULT_DL_CACHE_SIZE = 24,
+  };
+
+
   virtual ~FitzDocument();
   // Factory method to construct an instance of FitzDocument. path gives the
   // path to a file. password is the password to use to unlock the document;
   // specify nullptr if no password was provided. Does not take ownership of
   // password. Returns nullptr if the file cannot be opened.
   static FitzDocument* Open(
-      const std::string& path, const std::string* password);
+      const std::string& path, const std::string* password, size_t max_store_size_mb = DEFAULT_STORE_SIZE, size_t dl_cache_size = DEFAULT_DL_CACHE_SIZE);
   // See Document.
   int GetNumPages() override;
   // See Document.
   const PageSize GetPageSize(int page, float zoom, int rotation) override;
   // See Document. Thread-safe.
-  void Render(PixelWriter* pw, int page, float zoom, int rotation) override;
+  virtual void Render(PixelWriter* pw,
+      int page, float zoom, int rotation,
+      int clip_x, int clip_y, int clip_w, int clip_h) override;
   // See Document.
   const OutlineItem* GetOutline() override;
   // See Document.
@@ -64,12 +74,20 @@ class FitzDocument : public Document {
   fz_document* _fz_doc;
   // Mutex guarding MuPDF structures.
   std::recursive_mutex _fz_mutex;
+  // Displaylist Caching mechanism
+  int _max_dl_cache_size;
+  std::deque<int> _display_list_queue;
+  std::unordered_map<int, fz_display_list*> _display_list_cache;
 
   // We disallow the constructor; use the factory method Open() instead.
   FitzDocument(fz_context* _fz_context, fz_document* fz_document);
   // We disallow copying because we store lots of heap allocated state.
   explicit FitzDocument(const FitzDocument& other);
   FitzDocument& operator=(const FitzDocument& other);
+
+  fz_display_list* GetDisplayList(int page, FitzPageScopedPtr& page_ptr);
+  void SetDLCacheSize(size_t size);
+  void EvictFromDLCache();
 };
 
 #endif

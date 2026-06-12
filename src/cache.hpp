@@ -49,6 +49,7 @@ class Cache {
   // Child classes MUST call Clear() in their destructors. Waits for background
   // loading threads to terminate first.
   virtual ~Cache();
+  bool Contains(const K& key);
   // Retrieves an item. If the item is in the cache, simply returns it. If
   // not, loads it using the Load() function defined in an implementation.
   V Get(const K& key);
@@ -98,6 +99,13 @@ Cache<K, V>::Cache(int size)
 
 template <typename K, typename V>
 Cache<K, V>::~Cache() {
+}
+
+template <typename K, typename V>
+bool Cache<K, V>::Contains(const K& key) {
+    std::unique_lock<std::mutex> lock(_mutex);
+    auto i = _map.find(key);
+    return i != _map.end();
 }
 
 template <typename K, typename V>
@@ -218,4 +226,3 @@ void Cache<K, V>::Clear() {
 }
 
 #endif
-

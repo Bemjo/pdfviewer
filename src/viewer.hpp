@@ -22,6 +22,9 @@
 #ifndef VIEWER_HPP
 #define VIEWER_HPP
 
+#include <map>
+#include <memory>
+
 #include "cache.hpp"
 
 class Document;
@@ -101,6 +104,13 @@ class Viewer {
           ColorMode(NORMAL) {}
   };
 
+  struct PerPageState {
+    float Zoom;
+    int XOffset;
+    int YOffset;
+    int Rotation;
+  };
+
   // Constructs a new Viewer object. Does not take ownership of the document or
   // the framebuffer object.
   Viewer(
@@ -118,6 +128,8 @@ class Viewer {
   // replace illegal values. Has no effect until Render() is called.
   void SetState(const State& state);
 
+  PerPageState GetPageState(int page = -1);
+
  private:
   // The current document.
   Document* _doc;
@@ -125,6 +137,9 @@ class Viewer {
   Framebuffer* _fb;
   // Settings.
   State _state;
+
+  int _last_page;
+  std::map<int, PerPageState> _page_states;
 
   // Key to the render cache.
   struct RenderCacheKey {
@@ -146,14 +161,14 @@ class Viewer {
     bool operator<(const RenderCacheKey& other) const;
   };
   // Render cache class.
-  class RenderCache : public Cache<RenderCacheKey, PixelBuffer*> {
+  class RenderCache : public Cache<RenderCacheKey, std::shared_ptr<PixelBuffer>> {
    public:
     RenderCache(Viewer* parent, int size);
     virtual ~RenderCache();
 
    protected:
-    PixelBuffer* Load(const RenderCacheKey& key) override;
-    void Discard(const RenderCacheKey& key, PixelBuffer* const& value) override;
+    std::shared_ptr<PixelBuffer> Load(const RenderCacheKey& key) override;
+    void Discard(const RenderCacheKey& key, const std::shared_ptr<PixelBuffer>& value) override;
 
    private:
     Viewer* _parent;

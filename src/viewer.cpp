@@ -30,7 +30,7 @@
 #include "document.hpp"
 #include "framebuffer.hpp"
 
-const float Viewer::MAX_ZOOM = 10.0f;
+const float Viewer::MAX_ZOOM = 20.0f;
 const float Viewer::MIN_ZOOM = 0.1f;
 
 namespace {
@@ -42,7 +42,7 @@ class PixelBufferWriter : public Document::PixelWriter {
   // Constructs a PixelBuffer writer with the given settings. buffer_width
   // gives the number of pixels in a row in the buffer. buffer is the target
   // buffer.
-  PixelBufferWriter(PixelBuffer* buffer, Viewer::ColorMode color_mode)
+  PixelBufferWriter(std::shared_ptr<PixelBuffer> buffer, Viewer::ColorMode color_mode)
       : _buffer(buffer), _color_mode(color_mode) {}
   // See PixelWriter.
   void Write(int x, int y, uint8_t r, uint8_t g, uint8_t b) override {
@@ -74,7 +74,7 @@ class PixelBufferWriter : public Document::PixelWriter {
 
  private:
   // The destination buffer.
-  PixelBuffer* _buffer;
+  std::shared_ptr<PixelBuffer> _buffer;
   // The current color mode.
   Viewer::ColorMode _color_mode;
 };
@@ -87,7 +87,8 @@ Viewer::Viewer(
     : _doc(doc),
       _fb(fb),
       _state(state),
-      _render_cache(this, render_cache_size) {
+      _render_cache(this, render_cache_size),
+      _last_page(-1) {
   assert(_doc != nullptr);
   assert(_fb != nullptr);
 }
@@ -97,53 +98,71 @@ Viewer::~Viewer() {}
 void Viewer::Render() {
   // 1. Process state.
   int page = std::max(0, std::min(_doc->GetNumPages() - 1, _state.Page));
+
+  if (page != _last_page) {
+    auto it = _page_states.find(page);
+    if (it != _page_states.end()) {
+      _state.Zoom     = it->second.Zoom;
+      _state.XOffset  = it->second.XOffset;
+      _state.YOffset  = it->second.YOffset;
+      _state.Rotation = it->second.Rotation;
+    } else {
+      _state.Zoom     = ZOOM_TO_FIT;
+      _state.XOffset  = 0;
+      _state.YOffset  = 0;
+      _state.Rotation = 0;
+    }
+    _last_page = page;
+  }
+
   float zoom = _state.Zoom;
+  const PixelBuffer::Size& screen_size = _fb->GetSize();
+  const Document::PageSize& page_size = _doc->GetPageSize(page, 1.0f, _state.Rotation);
+
   if (zoom == ZOOM_TO_WIDTH) {
-    zoom = static_cast<float>(_fb->GetSize().Width) /
-           static_cast<float>(
-               _doc->GetPageSize(page, 1.0f, _state.Rotation).Width);
+    zoom = static_cast<float>(screen_size.Width) / static_cast<float>(page_size.Width);
   } else if (zoom == ZOOM_TO_FIT) {
-    const PixelBuffer::Size& screen_size = _fb->GetSize();
-    const Document::PageSize& page_size =
-        _doc->GetPageSize(page, 1.0f, _state.Rotation);
     zoom = std::min(
-        static_cast<float>(screen_size.Width) /
-            static_cast<float>(page_size.Width),
-        static_cast<float>(screen_size.Height) /
-            static_cast<float>(page_size.Height));
+        static_cast<float>(screen_size.Width) / static_cast<float>(page_size.Width),
+        static_cast<float>(screen_size.Height) / static_cast<float>(page_size.Height));
   }
   assert(zoom >= 0.0f);
   zoom = std::max(MIN_ZOOM, std::min(MAX_ZOOM, zoom));
 
-  // 2. Render page to buffer.
-  PixelBuffer* buffer = _render_cache.Get(
-      RenderCacheKey(page, zoom, _state.Rotation, _state.ColorMode));
+  const Document::PageSize& full_ps = _doc->GetPageSize(page, zoom, _state.Rotation);
 
-  // 3. Compute the area actually visible on screen.
-  const PixelBuffer::Size &screen_size = _fb->GetSize(),
-                          &page_size = buffer->GetSize();
+  const int max_x = std::max(0, full_ps.Width  - screen_size.Width);
+  const int max_y = std::max(0, full_ps.Height - screen_size.Height);
+  const int src_x = std::max(0, std::min(max_x, _state.XOffset));
+  const int src_y = std::max(0, std::min(max_y, _state.YOffset));
+  const int vp_w  = std::min(screen_size.Width,  full_ps.Width  - src_x);
+  const int vp_h  = std::min(screen_size.Height, full_ps.Height - src_y);
+
   PixelBuffer::Rect src_rect;
-  src_rect.X = std::max(
-      0, std::min(page_size.Width - screen_size.Width - 1, _state.XOffset));
-  src_rect.Y = std::max(
-      0, std::min(page_size.Height - screen_size.Height - 1, _state.YOffset));
-  src_rect.Width = std::min(screen_size.Width, page_size.Width - src_rect.X);
-  src_rect.Height = std::min(screen_size.Height, page_size.Height - src_rect.Y);
+  src_rect.X = 0;
+  src_rect.Y = 0;
+  src_rect.Width = vp_w;
+  src_rect.Height = vp_h;
+
+  _page_states[page]  = PerPageState{_state.Zoom, src_x, src_y, _state.Rotation};
+
+  // 2. Render page to buffer.
+  std::shared_ptr<PixelBuffer> buffer = _render_cache.Get(
+      RenderCacheKey(page, zoom, _state.Rotation, _state.ColorMode));
 
   // 4. Blit visible area to framebuffer.
   _fb->Render(*buffer, src_rect);
 
   // 5. Store corrected state.
   _state.Page = page;
-  _state.NumPages = _doc->GetNumPages();
   if ((_state.Zoom != ZOOM_TO_WIDTH) && (_state.Zoom != ZOOM_TO_FIT)) {
     _state.Zoom = zoom;
   }
   _state.ActualZoom = zoom;
-  _state.XOffset = src_rect.X;
-  _state.YOffset = src_rect.Y;
-  _state.PageWidth = page_size.Width;
-  _state.PageHeight = page_size.Height;
+  _state.XOffset = src_x;
+  _state.YOffset = src_y;
+  _state.PageWidth = full_ps.Width;
+  _state.PageHeight = full_ps.Height;
   _state.ScreenWidth = screen_size.Width;
   _state.ScreenHeight = screen_size.Height;
 
@@ -181,7 +200,7 @@ bool Viewer::RenderCacheKey::operator<(
   if (rotation_mod != other_rotation_mod) {
     return rotation_mod < other_rotation_mod;
   }
-  if (fabs(Zoom / other.Zoom - 1.0f) >= 0.1f) {
+  if (fabs(Zoom / other.Zoom - 1.0f) >= 0.001f) {
     return Zoom < other.Zoom;
   }
   if (ColorMode != other.ColorMode) {
@@ -191,23 +210,34 @@ bool Viewer::RenderCacheKey::operator<(
 }
 
 Viewer::RenderCache::RenderCache(Viewer* parent, int size)
-    : Cache<RenderCacheKey, PixelBuffer*>(size), _parent(parent) {}
+    : Cache<RenderCacheKey, std::shared_ptr<PixelBuffer>>(size), _parent(parent) {}
 
 Viewer::RenderCache::~RenderCache() { Clear(); }
 
-PixelBuffer* Viewer::RenderCache::Load(const RenderCacheKey& key) {
+std::shared_ptr<PixelBuffer> Viewer::RenderCache::Load(const RenderCacheKey& key) {
   const Document::PageSize& page_size =
       _parent->_doc->GetPageSize(key.Page, key.Zoom, key.Rotation);
 
-  PixelBuffer* buffer = _parent->_fb->NewPixelBuffer(
-      PixelBuffer::Size(page_size.Width, page_size.Height));
+  Viewer::PerPageState ps = _parent->GetPageState();
+
+  std::shared_ptr<PixelBuffer> buffer(_parent->_fb->NewPixelBuffer(
+      PixelBuffer::Size(page_size.Width, page_size.Height)));
   PixelBufferWriter writer(buffer, key.ColorMode);
-  _parent->_doc->Render(&writer, key.Page, key.Zoom, key.Rotation);
+  _parent->_doc->Render(&writer, key.Page, key.Zoom, key.Rotation,
+      ps.XOffset, ps.YOffset, page_size.Width, page_size.Height);
 
   return buffer;
 }
 
 void Viewer::RenderCache::Discard(
-    const RenderCacheKey& key, PixelBuffer* const& value) {
-  delete value;
+    const RenderCacheKey& key, const std::shared_ptr<PixelBuffer>& value) {
+}
+
+Viewer::PerPageState Viewer::GetPageState(int page) {
+  if (page < 0) {
+    return _page_states[_state.Page];
+  }
+
+  page = std::min(page, _state.NumPages);
+  return _page_states[page];
 }
