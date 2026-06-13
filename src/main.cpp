@@ -484,24 +484,6 @@ class ReloadCommand : public StateCommand {
   }
 };
 
-class ToggleInvertedColorModeCommand : public Command {
- public:
-  void Execute(int repeat, State* state) override {
-    state->ColorMode = state->ColorMode == Viewer::ColorMode::INVERTED
-                           ? Viewer::ColorMode::NORMAL
-                           : Viewer::ColorMode::INVERTED;
-  }
-};
-
-class ToggleSepiaColorModeCommand : public Command {
- public:
-  void Execute(int repeat, State* state) override {
-    state->ColorMode = state->ColorMode == Viewer::ColorMode::SEPIA
-                           ? Viewer::ColorMode::NORMAL
-                           : Viewer::ColorMode::SEPIA;
-  }
-};
-
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
  *                               END COMMANDS                                *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -524,10 +506,6 @@ static const char* HELP_STRING =
     "\t--zoom_to_fit         Start in automatic zoom-to-fit mode.\n"
     "\t--zoom_to_width       Start in automatic zoom-to-width mode.\n"
     "\t--rotation=N, -r N    Set initial rotation to N degrees clockwise.\n"
-    "\t--color_mode=invert, -c invert\n"
-    "\t                      Start in inverted color mode.\n"
-    "\t--color_mode=sepia, -c sepia\n"
-    "\t                      Start in sepia color mode.\n"
 #if defined(JFBVIEW_ENABLE_LEGACY_IMAGE_IMPL) && \
     defined(JFBVIEW_ENABLE_LEGACY_PDF_IMPL) && !defined(JFBVIEW_NO_IMLIB2)
     "\t--format=image, -f image\n"
@@ -542,7 +520,7 @@ static const char* HELP_STRING =
     "\t                      huge documents, or if you just want to reduce\n"
     "\t                      memory usage, you might want to set this to a\n"
     "\t                      smaller number.\n"
-    "\t--store_size=N        Set MuPDF store size limit to N MB (default 32).\n"
+    "\t--store_size=N        Set MuPDF store size limit to N MB (default 64).\n"
     "\n"
     "jfbview home page: https://github.com/jichu4n/jfbview\n"
     "Bug reports & suggestions: https://github.com/jichu4n/jfbview/issues\n"
@@ -572,7 +550,6 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
       {"zoom_to_width", false, nullptr, ZOOM_TO_WIDTH},
       {"zoom_to_fit", false, nullptr, ZOOM_TO_FIT},
       {"rotation", true, nullptr, 'r'},
-      {"color_mode", true, nullptr, 'c'},
       {"format", true, nullptr, 'f'},
       {"cache_size", true, nullptr, RENDER_CACHE_SIZE},
       {"fb_debug_info", false, nullptr, PRINT_FB_DEBUG_INFO_AND_EXIT},
@@ -651,20 +628,6 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
           exit(EXIT_FAILURE);
         }
         break;
-      case 'c': {
-        const std::string arg = ToLower(optarg);
-        if (arg == "normal" || arg == "") {
-          state->ColorMode = Viewer::ColorMode::NORMAL;
-        } else if (arg == "invert" || arg == "inverted") {
-          state->ColorMode = Viewer::ColorMode::INVERTED;
-        } else if (arg == "sepia") {
-          state->ColorMode = Viewer::ColorMode::SEPIA;
-        } else {
-          fprintf(stderr, "Invalid color mode \"%s\"\n", optarg);
-          exit(EXIT_FAILURE);
-        }
-        break;
-      }
       case PRINT_FB_DEBUG_INFO_AND_EXIT:
         state->PrintFBDebugInfoAndExit = true;
         break;
@@ -742,9 +705,6 @@ std::unique_ptr<Registry> BuildRegistry() {
   registry->Register('`', std::move(std::make_unique<RestoreStateCommand>()));
 
   registry->Register('e', std::move(std::make_unique<ReloadCommand>()));
-
-  registry->Register('I', std::make_unique<ToggleInvertedColorModeCommand>());
-  registry->Register('S', std::make_unique<ToggleSepiaColorModeCommand>());
 
   // MiSTer additions
   registry->Register(27 /* Escape */, std::move(std::make_unique<ExitCommand>()));
@@ -921,15 +881,15 @@ int main(int argc, char* argv[]) {
   } while (!state.Exit);
 
   // 3. Clean up.
-  state.ViewerInst.reset();
   state.SearchViewInst.reset();
   state.OutlineViewInst.reset();
   // Hack alert: Calling endwin() immediately after the framebuffer destructor
   // (which clears the screen) appears to cause a race condition where the next
   // shell prompt after this program exits would also get erased. Adding a
   // short sleep appears to fix the issue.
-  state.FramebufferInst.reset();
   state.DocumentInst.reset();
+  state.FramebufferInst.reset();
+  state.ViewerInst.reset();
   usleep(100 * 1000);
   endwin();
 

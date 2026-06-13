@@ -39,7 +39,6 @@ PixelBuffer::PixelBuffer(
       _has_ownership(true) {
   assert(_format != nullptr);
   _buffer = new uint8_t[GetBufferByteSize()];
-  Init();
 }
 
 PixelBuffer::PixelBuffer(
@@ -56,7 +55,6 @@ PixelBuffer::PixelBuffer(
   assert(_buffer != nullptr);
   assert(_size.Width + _offset.Width <= _allocated_size.Width);
   assert(_size.Height + _offset.Height <= _allocated_size.Height);
-  Init();
 }
 
 PixelBuffer::~PixelBuffer() {
@@ -69,10 +67,6 @@ PixelBuffer::Size PixelBuffer::GetSize() const { return _size; }
 
 PixelBuffer::Rect PixelBuffer::GetRect() const {
   return Rect(0, 0, _size.Width, _size.Height);
-}
-
-void PixelBuffer::WritePixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
-  _pixel_writer_impl->WritePixel(_format->Pack(r, g, b), GetPixelAddress(x, y));
 }
 
 void PixelBuffer::Copy(
@@ -137,56 +131,12 @@ void PixelBuffer::Copy(
   });
 }
 
-void PixelBuffer::Init() {
-  // Detect endian-ness.
-  uint16_t x = 1;
-  bool little_endian = (reinterpret_cast<uint8_t*>(&x))[0];
-  // Set up writer impl.
-  switch (_format->GetDepth()) {
-    case 1:
-      _pixel_writer_impl = &_pixel_writer_impl_1;
-      break;
-    case 2:
-      _pixel_writer_impl = &_pixel_writer_impl_2;
-      break;
-    case 3:
-      if (little_endian) {
-        _pixel_writer_impl = &_pixel_writer_impl_3_little_endian;
-      } else {
-        _pixel_writer_impl = &_pixel_writer_impl_3_big_endian;
-      }
-      break;
-    case 4:
-      _pixel_writer_impl = &_pixel_writer_impl_4;
-      break;
-    default:
-      fprintf(stderr, "Unsupported color depth %d", _format->GetDepth());
-      abort();
-  }
+uint8_t* PixelBuffer::GetRawBuffer() const {
+  return _buffer;
 }
 
-void PixelBuffer::PixelWriterImpl1::WritePixel(uint32_t value, void* dest) {
-  *(reinterpret_cast<uint8_t*>(dest)) = static_cast<uint8_t>(value);
-}
-
-void PixelBuffer::PixelWriterImpl2::WritePixel(uint32_t value, void* dest) {
-  *(reinterpret_cast<uint16_t*>(dest)) = static_cast<uint16_t>(value);
-}
-
-void PixelBuffer::PixelWriterImpl3LittleEndian::WritePixel(
-    uint32_t value, void* dest) {
-  *(reinterpret_cast<uint16_t*>(dest)) = static_cast<uint16_t>(value);
-  *(reinterpret_cast<uint8_t*>(dest) + 2) = static_cast<uint8_t>(value >> 16);
-}
-
-void PixelBuffer::PixelWriterImpl3BigEndian::WritePixel(
-    uint32_t value, void* dest) {
-  *(reinterpret_cast<uint16_t*>(dest)) = static_cast<uint16_t>(value >> 8);
-  *(reinterpret_cast<uint8_t*>(dest) + 2) = static_cast<uint8_t>(value);
-}
-
-void PixelBuffer::PixelWriterImpl4::WritePixel(uint32_t value, void* dest) {
-  *(reinterpret_cast<uint32_t*>(dest)) = static_cast<uint32_t>(value);
+int PixelBuffer::GetAllocatedStrideBytes() const {
+  return _allocated_size.Width * _format->GetDepth();
 }
 
 int PixelBuffer::GetBufferByteSize() const {

@@ -23,7 +23,6 @@
 
 #include <cassert>
 
-#include "multithreading.hpp"
 #include "string_utils.hpp"
 
 FitzDocument* FitzDocument::Open(const std::string& path, const std::string* password,
@@ -106,6 +105,9 @@ FitzDocument::FitzDocument(fz_context* fz_ctx, fz_document* fz_doc)
 
 FitzDocument::~FitzDocument() {
   std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
+  for (auto& kv : _display_list_cache) {
+    fz_drop_display_list(_fz_ctx, kv.second);
+  }
   fz_drop_document(_fz_ctx, _fz_doc);
   fz_drop_context(_fz_ctx);
 }
@@ -120,14 +122,13 @@ const Document::PageSize FitzDocument::GetPageSize(
   std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
   assert((page >= 0) && (page < GetNumPages()));
   const fz_matrix& m = ComputeTransformMatrix(zoom, rotation);
-  FitzPageScopedPtr page_ptr(_fz_ctx, fz_load_page(_fz_ctx, _fz_doc, page));
-  fz_display_list* display_list = GetDisplayList(page, page_ptr);
+  fz_display_list* display_list = GetDisplayList(page);
   fz_rect bounds = fz_bound_display_list(_fz_ctx, display_list);
   fz_irect bbox = fz_round_rect(fz_transform_rect(bounds, m));
   return PageSize(bbox.x1 - bbox.x0, bbox.y1 - bbox.y0);
 }
 
-fz_display_list* FitzDocument::GetDisplayList(int page, FitzPageScopedPtr& page_ptr) {
+fz_display_list* FitzDocument::GetDisplayList(int page) {
   std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
   auto it = _display_list_cache.find(page);
   if (it != _display_list_cache.end()) {
@@ -139,34 +140,38 @@ fz_display_list* FitzDocument::GetDisplayList(int page, FitzPageScopedPtr& page_
     EvictFromDLCache();
   }
 
-  fz_display_list* display_list = fz_new_display_list_from_page(_fz_ctx, page_ptr.get());
+  FitzPageScopedPtr pp(_fz_ctx, fz_load_page(_fz_ctx, _fz_doc, page));
+  fz_display_list* display_list = fz_new_display_list_from_page(_fz_ctx, pp.get());
 
-  fz_keep_display_list(_fz_ctx, display_list);
   _display_list_cache[page] = display_list;
   _display_list_queue.push_back(page);
   return display_list;
 }
 
-void FitzDocument::Render(
-    Document::PixelWriter* pw, int page, float zoom, int rotation,
+bool FitzDocument::Render(
+    uint8_t* buffer, int stride_bytes, int page, float zoom, int rotation,
     int clip_x, int clip_y, int clip_w, int clip_h) {
   std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
   assert((page >= 0) && (page < GetNumPages()));
 
   // 1. Init MuPDF structures.
   const fz_matrix& m = ComputeTransformMatrix(zoom, rotation);
-  FitzPageScopedPtr page_ptr(_fz_ctx, fz_load_page(_fz_ctx, _fz_doc, page));
-  fz_display_list* display_list = GetDisplayList(page, page_ptr);
+  fz_display_list* display_list = GetDisplayList(page);
   fz_rect bounds = fz_bound_display_list(_fz_ctx, display_list);
   fz_irect bbox, full_bbox = fz_round_rect(fz_transform_rect(bounds, m));
+
   bbox.x0 = std::max(full_bbox.x0, full_bbox.x0 + clip_x);
   bbox.y0 = std::max(full_bbox.y0, full_bbox.y0 + clip_y);
   bbox.x1 = std::min(full_bbox.x1, bbox.x0 + clip_w);
   bbox.y1 = std::min(full_bbox.y1, bbox.y0 + clip_h);
 
+  if (stride_bytes != (bbox.x1 - bbox.x0) * 4) {
+    return false;
+  }
+
   FitzPixmapScopedPtr pixmap_ptr(
-      _fz_ctx, fz_new_pixmap_with_bbox(
-                   _fz_ctx, fz_device_rgb(_fz_ctx), bbox, nullptr, 1));
+      _fz_ctx, fz_new_pixmap_with_bbox_and_data(
+                   _fz_ctx, fz_device_bgr(_fz_ctx), bbox, nullptr, 1, buffer));
   FitzDeviceScopedPtr dev_ptr(
       _fz_ctx, fz_new_draw_device(_fz_ctx, fz_identity, pixmap_ptr.get()));
 
@@ -174,30 +179,10 @@ void FitzDocument::Render(
   fz_clear_pixmap_with_value(_fz_ctx, pixmap_ptr.get(), 0xff);
   fz_rect clip_rect = fz_rect_from_irect(bbox);
   fz_run_display_list(_fz_ctx, display_list, dev_ptr.get(), m, clip_rect, nullptr);
-
-  // 3. Write pixmap to buffer. The page is vertically divided into n equal
-  // stripes, each copied to pw by one thread.
-  assert(fz_pixmap_components(_fz_ctx, pixmap_ptr.get()) == 4);
-  uint8_t* buffer = reinterpret_cast<uint8_t*>(fz_pixmap_samples(_fz_ctx, pixmap_ptr.get()));
-  const int num_cols = fz_pixmap_width(_fz_ctx, pixmap_ptr.get());
-  const int num_rows = fz_pixmap_height(_fz_ctx, pixmap_ptr.get());
-
-  ExecuteInParallel([=](int num_threads, int i) {
-    const int num_rows_per_thread = num_rows / num_threads;
-    const int y_begin = i * num_rows_per_thread;
-    const int y_end =
-        (i == num_threads - 1) ? num_rows : (i + 1) * num_rows_per_thread;
-    const uint8_t* p = buffer + y_begin * num_cols * 4;
-    for (int y = y_begin; y < y_end; ++y) {
-      for (int x = 0; x < num_cols; ++x) {
-        pw->Write(x, y, p[0], p[1], p[2]);
-        p += 4;
-      }
-    }
-  });
-
   // 4. Clean up.
   fz_close_device(_fz_ctx, dev_ptr.get());
+
+  return true;
 }
 
 const Document::OutlineItem* FitzDocument::GetOutline() {

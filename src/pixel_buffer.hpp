@@ -71,9 +71,6 @@ class PixelBuffer {
   // Returns a rect covering the buffer exactly.
   Rect GetRect() const;
 
-  // Writes a pixel value to a location in the buffer.
-  void WritePixel(int x, int y, uint8_t r, uint8_t g, uint8_t b);
-
   // Copies a region in the current pixel buffer to another pixel buffer. The
   // destination region must be at least as large in both dimensions than the
   // source region. The source region is centered if the destination region is
@@ -81,38 +78,9 @@ class PixelBuffer {
   void Copy(
       const Rect& src_rect, const Rect& dest_rect, PixelBuffer* dest) const;
 
+  uint8_t* GetRawBuffer() const;
+  int GetAllocatedStrideBytes() const;
  private:
-  // Prototype for a method that writes a pixel value to a location.
-  class PixelWriterImpl {
-   public:
-    virtual void WritePixel(uint32_t value, void* dest) = 0;
-  };
-  // A pixel writer impl for depth = 1.
-  class PixelWriterImpl1 : public PixelWriterImpl {
-   public:
-    void WritePixel(uint32_t value, void* dest) override;
-  } _pixel_writer_impl_1;
-  // A pixel writer impl for depth = 2.
-  class PixelWriterImpl2 : public PixelWriterImpl {
-   public:
-    void WritePixel(uint32_t value, void* dest) override;
-  } _pixel_writer_impl_2;
-  // A pixel writer impl for depth = 3.
-  class PixelWriterImpl3LittleEndian : public PixelWriterImpl {
-   public:
-    void WritePixel(uint32_t value, void* dest) override;
-  } _pixel_writer_impl_3_little_endian;
-  // A pixel writer impl for depth = 3.
-  class PixelWriterImpl3BigEndian : public PixelWriterImpl {
-   public:
-    void WritePixel(uint32_t value, void* dest) override;
-  } _pixel_writer_impl_3_big_endian;
-  // A pixel writer impl for depth = 4.
-  class PixelWriterImpl4 : public PixelWriterImpl {
-   public:
-    void WritePixel(uint32_t value, void* dest) override;
-  } _pixel_writer_impl_4;
-
   // Size of the buffer.
   Size _size;
   // The allocated size of the buffer. If the buffer was allocated by this
@@ -131,12 +99,7 @@ class PixelBuffer {
   uint8_t* _buffer;
   // Whether we own _buffer.
   bool _has_ownership;
-  // Pixel writer implementation for current buffer. One of
-  // _pixel_writer_impl_*.
-  PixelWriterImpl* _pixel_writer_impl;
 
-  // Common initialization called by both constructors.
-  void Init();
   // Returns the size of the buffer in bytes.
   int GetBufferByteSize() const;
   // Returns the address in memory corresponding to the pixel (x, y).

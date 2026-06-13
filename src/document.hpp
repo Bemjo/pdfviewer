@@ -38,14 +38,6 @@ class Document {
         : Width(width), Height(height) {}
   };
 
-  // An interface for a callback that stores a pixel in a memory buffer.
-  class PixelWriter {
-   public:
-    // Writes a pixel value (r, g, b) to position (x, y). It is important that
-    // Write be thread-safe when called with different (x, y).
-    virtual void Write(int x, int y, uint8_t r, uint8_t g, uint8_t b) = 0;
-  };
-
   // An item in a outline. An item may contain further children items.
   class OutlineItem {
    public:
@@ -103,7 +95,7 @@ class Document {
   // the zoom ratio as a fraction, e.g., 1.5 = 150%. rotation is the desired
   // rotation in clockwise degrees. For every rendered pixel, pw will be invoked
   // to store that pixel value somewhere.
-  virtual void Render(PixelWriter* pw,
+  virtual bool Render(uint8_t* buffer, int stride_bytes,
       int page, float zoom, int rotation,
       int clip_x, int clip_y, int clip_w, int clip_h) = 0;
 

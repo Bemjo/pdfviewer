@@ -36,8 +36,8 @@
 class FitzDocument : public Document {
  public:
  enum {
-    DEFAULT_STORE_SIZE = 32,
-    DEFAULT_DL_CACHE_SIZE = 24,
+    DEFAULT_STORE_SIZE = 64,
+    DEFAULT_DL_CACHE_SIZE = 32,
   };
 
 
@@ -53,7 +53,7 @@ class FitzDocument : public Document {
   // See Document.
   const PageSize GetPageSize(int page, float zoom, int rotation) override;
   // See Document. Thread-safe.
-  virtual void Render(PixelWriter* pw,
+  virtual bool Render(uint8_t* buffer, int stride_bytes,
       int page, float zoom, int rotation,
       int clip_x, int clip_y, int clip_w, int clip_h) override;
   // See Document.
@@ -85,7 +85,7 @@ class FitzDocument : public Document {
   explicit FitzDocument(const FitzDocument& other);
   FitzDocument& operator=(const FitzDocument& other);
 
-  fz_display_list* GetDisplayList(int page, FitzPageScopedPtr& page_ptr);
+  fz_display_list* GetDisplayList(int page);
   void SetDLCacheSize(size_t size);
   void EvictFromDLCache();
 };
