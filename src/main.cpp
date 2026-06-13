@@ -41,6 +41,7 @@
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <algorithm>
 #include <cmath>
@@ -53,6 +54,8 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <atomic>
+#include <thread>
 
 #include "command.hpp"
 #include "cpp_compat.hpp"
@@ -63,6 +66,34 @@
 #include "pdf_document.hpp"
 #include "search_view.hpp"
 #include "viewer.hpp"
+
+struct InputState {
+  enum {DEFAULT_PAGE_EDGE_TIME = 100 };
+
+  int EdgeGuardTime;
+  std::atomic<bool> AtPageEdge;
+  std::atomic<bool> EdgeReleased;
+  // +1 = down edge, -1 = up edge, 0 = none
+  std::atomic<int> EdgeDirection;
+  std::atomic<bool> InputThreadExit;
+  std::atomic<int> InputKey;
+  std::atomic<int> InputRepeat;
+
+  InputState()
+      : EdgeGuardTime(InputState::DEFAULT_PAGE_EDGE_TIME),
+        AtPageEdge(false),
+        EdgeReleased(false),
+        EdgeDirection(0),
+        InputThreadExit(false),
+        InputKey(ERR),
+        InputRepeat(Command::NO_REPEAT) {}
+
+  void ClearPageGuard() {
+    AtPageEdge.store(false, std::memory_order_relaxed);
+    EdgeReleased.store(false, std::memory_order_relaxed);
+    EdgeDirection.store(0, std::memory_order_relaxed);
+  }
+};
 
 // Main program state.
 struct State : public Viewer::State {
@@ -85,6 +116,7 @@ struct State : public Viewer::State {
   int RenderCacheSize;
   // Maximum cache store size in bytes for MuPDF
   int MuPDFStoreSize;
+
   // Input file.
   std::string FilePath;
   // Password for the input file. If no password is provided, this will be
@@ -104,6 +136,8 @@ struct State : public Viewer::State {
   std::unique_ptr<Framebuffer> FramebufferInst;
   // Viewer instance.
   std::unique_ptr<Viewer> ViewerInst;
+
+  InputState inputState;
 
   // Default state.
   State()
@@ -223,11 +257,28 @@ class MoveDownCommand : public MoveCommand {
  public:
   void Execute(int repeat, State* state) override {
     state->YOffset += RepeatOrDefault(repeat, 1) * GetMoveSize(state, false);
-    if (state->YOffset + state->ScreenHeight >=
-        state->PageHeight - 1 + GetMoveSize(state, false)) {
-      if (++(state->Page) < state->NumPages) {
-        state->YOffset = 0;
+
+    const bool at_bottom = (state->YOffset + state->ScreenHeight) >=
+         (state->PageHeight - 1 + GetMoveSize(state, false));
+
+    if (at_bottom) {
+      if (state->Zoom > 0 && state->PageHeight > state->ScreenHeight) {
+        if (state->inputState.EdgeReleased.exchange(false, std::memory_order_relaxed)) {
+          if (++(state->Page) < state->NumPages) {
+            state->YOffset = 0;
+          }
+        } else {
+          state->inputState.AtPageEdge.store(true, std::memory_order_relaxed);
+          state->inputState.EdgeDirection.store(1, std::memory_order_relaxed);
+        }
+      } else {
+        if (++(state->Page) < state->NumPages) {
+          state->YOffset = 0;
+        }
+        state->inputState.ClearPageGuard();
       }
+    } else {
+      state->inputState.ClearPageGuard();
     }
   }
 };
@@ -236,10 +287,27 @@ class MoveUpCommand : public MoveCommand {
  public:
   void Execute(int repeat, State* state) override {
     state->YOffset -= RepeatOrDefault(repeat, 1) * GetMoveSize(state, false);
-    if (state->YOffset <= -GetMoveSize(state, false)) {
-      if (--(state->Page) >= 0) {
-        state->YOffset = INT_MAX;
+
+    const bool at_top = state->YOffset <= -GetMoveSize(state, false);
+
+    if (at_top) {
+      if (state->Zoom > 0 && state->PageHeight > state->ScreenHeight) {
+        if (state->inputState.EdgeReleased.exchange(false, std::memory_order_relaxed)) {
+          if (--(state->Page) >= 0) {
+            state->YOffset = INT_MAX;
+          }
+        } else {
+          state->inputState.AtPageEdge.store(true, std::memory_order_relaxed);
+          state->inputState.EdgeDirection.store(-1, std::memory_order_relaxed);
+        }
+      } else {
+        if (--(state->Page) >= 0) {
+          state->YOffset = INT_MAX;
+        }
+        state->inputState.ClearPageGuard();
       }
+    } else {
+      state->inputState.ClearPageGuard();
     }
   }
 };
@@ -248,6 +316,7 @@ class MoveLeftCommand : public MoveCommand {
  public:
   void Execute(int repeat, State* state) override {
     state->XOffset -= RepeatOrDefault(repeat, 1) * GetMoveSize(state, true);
+    state->inputState.ClearPageGuard();
   }
 };
 
@@ -255,6 +324,7 @@ class MoveRightCommand : public MoveCommand {
  public:
   void Execute(int repeat, State* state) override {
     state->XOffset += RepeatOrDefault(repeat, 1) * GetMoveSize(state, true);
+    state->inputState.ClearPageGuard();
   }
 };
 
@@ -268,6 +338,7 @@ class ScreenDownCommand : public Command {
         state->YOffset = 0;
       }
     }
+    state->inputState.ClearPageGuard();
   }
 };
 
@@ -280,6 +351,7 @@ class ScreenUpCommand : public Command {
         state->YOffset = INT_MAX;
       }
     }
+    state->inputState.ClearPageGuard();
   }
 };
 
@@ -287,6 +359,7 @@ class PageDownCommand : public Command {
  public:
   void Execute(int repeat, State* state) override {
     state->Page += RepeatOrDefault(repeat, 1);
+    state->inputState.ClearPageGuard();
   }
 };
 
@@ -294,6 +367,7 @@ class PageUpCommand : public Command {
  public:
   void Execute(int repeat, State* state) override {
     state->Page -= RepeatOrDefault(repeat, 1);
+    state->inputState.ClearPageGuard();
   }
 };
 
@@ -326,6 +400,7 @@ class ZoomCommand : public Command {
     state->YOffset = static_cast<int>(new_center_y) - state->ScreenHeight / 2;
     // New zoom.
     state->Zoom = zoom;
+    state->inputState.ClearPageGuard();
   }
 };
 const float ZoomCommand::ZOOM_COEFFICIENT = 1.2f;
@@ -359,6 +434,7 @@ class SetRotationCommand : public Command {
  public:
   void Execute(int repeat, State* state) override {
     state->Rotation = RepeatOrDefault(repeat, 0);
+    state->inputState.ClearPageGuard();
   }
 };
 
@@ -368,6 +444,7 @@ class RotateCommand : public Command {
 
   void Execute(int repeat, State* state) override {
     state->Rotation += RepeatOrDefault(repeat, 1) * _increment;
+    state->inputState.ClearPageGuard();
   }
 
  private:
@@ -378,6 +455,7 @@ class ZoomToFitCommand : public Command {
  public:
   void Execute(int repeat, State* state) override {
     state->Zoom = Viewer::ZOOM_TO_FIT;
+    state->inputState.ClearPageGuard();
   }
 };
 
@@ -412,6 +490,7 @@ class GoToPageCommand : public Command {
       state->XOffset = 0;
       state->YOffset = 0;
     }
+    state->inputState.ClearPageGuard();
   }
 
  private:
@@ -478,6 +557,7 @@ class ReloadCommand : public StateCommand {
       state->ViewerInst = std::make_unique<Viewer>(
           state->DocumentInst.get(), state->FramebufferInst.get(), *state,
           state->RenderCacheSize);
+      state->inputState.ClearPageGuard();
     } else {
       state->Exit = true;
     }
@@ -521,6 +601,9 @@ static const char* HELP_STRING =
     "\t                      memory usage, you might want to set this to a\n"
     "\t                      smaller number.\n"
     "\t--store_size=N        Set MuPDF store size limit to N MB (default 64).\n"
+    "\t--guard_time=N        Time in milliseconds where input must be released\n"
+    "\t                      to trigger a page change when moving up or down.\n"
+    "\t                      Set to 0 to disable. Default 100.\n"
     "\n"
     "jfbview home page: https://github.com/jichu4n/jfbview\n"
     "Bug reports & suggestions: https://github.com/jichu4n/jfbview/issues\n"
@@ -533,6 +616,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
   enum {
     RENDER_CACHE_SIZE = 0x1000,
     STORE_SIZE,
+    GUARD_TIME,
     ZOOM_TO_WIDTH,
     ZOOM_TO_FIT,
     FB,
@@ -554,6 +638,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
       {"cache_size", true, nullptr, RENDER_CACHE_SIZE},
       {"fb_debug_info", false, nullptr, PRINT_FB_DEBUG_INFO_AND_EXIT},
       {"store_size", true, nullptr, STORE_SIZE},
+      {"guard_time", true,  nullptr, GUARD_TIME},
       {0, 0, 0, 0},
   };
   static const char* ShortFlags = "hP:p:z:r:c:f:";
@@ -601,6 +686,13 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
           exit(EXIT_FAILURE);
         }
         state->MuPDFStoreSize = std::max(0, state->MuPDFStoreSize);
+        break;
+      case GUARD_TIME:
+        if (sscanf(optarg, "%d", &(state->inputState.EdgeGuardTime)) < 0) {
+          fprintf(stderr, "Invalid guard time \"%s\"\n", optarg);
+          exit(EXIT_FAILURE);
+        }
+        state->inputState.EdgeGuardTime = std::max(0, state->inputState.EdgeGuardTime);
         break;
       case 'p':
         if (sscanf(optarg, "%d", &(state->Page)) < 1) {
@@ -749,6 +841,75 @@ out:
   close(fd);
 }
 
+static void InputThread(InputState* state) {
+  timespec now                = {0, 0};
+  timespec edge_release_start = {0, 0};
+  bool     timing_release     = false;
+  int      repeat             = Command::NO_REPEAT;
+
+  for (;;) {
+    if (state->InputThreadExit.load(std::memory_order_relaxed)) {
+      return;
+    }
+
+    int key = getch();
+
+    if (state->AtPageEdge.load(std::memory_order_relaxed)) {
+      const int  edge_dir    = state->EdgeDirection.load(std::memory_order_relaxed);
+      const bool key_matches = (edge_dir > 0 && (key == KEY_DOWN || key == 'j')) ||
+                               (edge_dir < 0 && (key == KEY_UP   || key == 'k'));
+      if (key != ERR && !key_matches) {
+        state->ClearPageGuard();
+        timing_release     = false;
+        edge_release_start = {0, 0};
+      } else {
+        repeat = Command::NO_REPEAT;
+        state->InputKey.store(ERR, std::memory_order_relaxed);
+        if (key != ERR) {
+          timing_release     = false;
+          edge_release_start = {0, 0};
+        } else if (!timing_release) {
+          clock_gettime(CLOCK_MONOTONIC, &edge_release_start);
+          timing_release = true;
+        } else {
+          clock_gettime(CLOCK_MONOTONIC, &now);
+          const long elapsed_ms =
+              (now.tv_sec  - edge_release_start.tv_sec)  * 1000 +
+               (now.tv_nsec - edge_release_start.tv_nsec) / 1000000;
+          if (elapsed_ms >= state->EdgeGuardTime) {
+            state->AtPageEdge.store(false, std::memory_order_relaxed);
+            state->EdgeReleased.store(true, std::memory_order_relaxed);
+            timing_release     = false;
+            edge_release_start = {0, 0};
+          }
+        }
+        usleep(10000);
+        continue;
+      }
+    } else {
+      timing_release     = false;
+      edge_release_start = {0, 0};
+    }
+
+    if (isdigit(key)) {
+      nodelay(stdscr, false);
+      do {
+        if (repeat == Command::NO_REPEAT) {
+          repeat = key - '0';
+        } else {
+          repeat = repeat * 10 + key - '0';
+        }
+      } while (isdigit(key = getch()));
+      nodelay(stdscr, true);
+      state->InputRepeat.store(repeat, std::memory_order_relaxed);
+    }
+    repeat = Command::NO_REPEAT;
+    state->InputKey.store(key, std::memory_order_relaxed);
+
+    usleep(10000);
+  }
+}
+
 void PrintFBDebugInfo(Framebuffer* fb) {
   assert(fb != nullptr);
   fprintf(stdout, "%s", fb->GetDebugInfoString().c_str());
@@ -812,9 +973,13 @@ int main(int argc, char* argv[]) {
   cbreak();
   noecho();
   curs_set(false);
+  set_escdelay(25);
+  nodelay(stdscr, true);
   // This is necessary to prevent curses erasing the framebuffer on first call
   // to getch().
   refresh();
+
+
 
   state.ViewerInst = std::make_unique<Viewer>(
       state.DocumentInst.get(), state.FramebufferInst.get(), state,
@@ -842,15 +1007,17 @@ int main(int argc, char* argv[]) {
     exit(EXIT_FAILURE);
   }
 
+  std::thread input_thread(InputThread, &state.inputState);
+
   // 2. Main event loop.
   state.Render = true;
-  int repeat = Command::NO_REPEAT;
-  do {
+  while (!state.Exit) {
     // 2.1 Render.
     if (state.Render) {
       state.ViewerInst->SetState(state);
       state.ViewerInst->Render();
       state.ViewerInst->GetState(&state);
+      state.Render = false;
 
       if (!state.StatusFile.empty()) {
         FILE* status_file = fopen(state.StatusFile.c_str(), "a");
@@ -860,27 +1027,25 @@ int main(int argc, char* argv[]) {
         }
       }
     }
-    state.Render = true;
 
     // 2.2. Grab input.
-    int c;
-    while (isdigit(c = getch())) {
-      if (repeat == Command::NO_REPEAT) {
-        repeat = c - '0';
-      } else {
-        repeat = repeat * 10 + c - '0';
-      }
-    }
-    if (c == KEY_RESIZE) {
-      continue;
-    }
+    const int last = state.inputState.InputKey.exchange(ERR, std::memory_order_relaxed);
 
     // 2.3. Run command.
-    registry->Dispatch(c, repeat, &state);
-    repeat = Command::NO_REPEAT;
-  } while (!state.Exit);
+    if (last != ERR) {
+      if (last != KEY_RESIZE) {
+        const int repeat = state.inputState.InputRepeat.exchange(Command::NO_REPEAT, std::memory_order_relaxed);
+        registry->Dispatch(last, repeat, &state);
+      }
+      state.Render = true;
+    } else {
+      usleep(5000);
+     }
+  }
 
   // 3. Clean up.
+  state.inputState.InputThreadExit.store(true, std::memory_order_relaxed);
+  input_thread.join();
   state.SearchViewInst.reset();
   state.OutlineViewInst.reset();
   // Hack alert: Calling endwin() immediately after the framebuffer destructor

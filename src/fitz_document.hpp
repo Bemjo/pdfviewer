@@ -36,8 +36,8 @@
 class FitzDocument : public Document {
  public:
  enum {
-    DEFAULT_STORE_SIZE = 64,
-    DEFAULT_DL_CACHE_SIZE = 32,
+    DEFAULT_STORE_SIZE = 32,
+    DEFAULT_DL_CACHE_SIZE = 16
   };
 
 
