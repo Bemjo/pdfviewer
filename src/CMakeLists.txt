@@ -131,6 +131,7 @@ set(
   main.cpp
   jpdfgrep.cpp
   jpdfcat.cpp
+  pdfmeta.cpp
 )
 add_executable(jfbview ${jfbview_sources})
 target_link_libraries(jfbview jfbview_document_viewer)
@@ -166,4 +167,3 @@ if(ENABLE_LEGACY_IMAGE_IMPL)
     install(TARGETS jfbpdf DESTINATION bin)
   endif()
 endif()
-

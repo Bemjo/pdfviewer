@@ -66,6 +66,7 @@
 #include "pdf_document.hpp"
 #include "search_view.hpp"
 #include "viewer.hpp"
+#include "pdfmeta.hpp"
 
 struct InputState {
   enum {DEFAULT_PAGE_EDGE_TIME = 100 };
@@ -126,6 +127,8 @@ struct State : public Viewer::State {
   std::string FramebufferDevice;
   // Output file to append to when rendering is complete.
   std::string StatusFile;
+
+  std::string MetaRootDir;
   // Document instance.
   std::unique_ptr<Document> DocumentInst;
   // Outline view instance.
@@ -152,6 +155,7 @@ struct State : public Viewer::State {
         FilePassword(),
         FramebufferDevice(Framebuffer::DEFAULT_FRAMEBUFFER_DEVICE),
         StatusFile(""),
+        MetaRootDir("docs/"),
         OutlineViewInst(nullptr),
         SearchViewInst(nullptr),
         FramebufferInst(nullptr),
@@ -230,6 +234,22 @@ static bool LoadFile(State* state) {
   state->DocumentInst.reset(doc);
   state->NumPages = state->DocumentInst->GetNumPages();
   return true;
+}
+
+static void LoadMetadata(State* state) {
+  if (state->Page == 0) {
+    const MetaData& data = PdfMetaLoad(state->FilePath, state->MetaRootDir);
+    if (data.page > 0) {
+      state->Page = std::max(0, std::min(static_cast<int>(data.page), state->NumPages - 1));
+    }
+  }
+}
+
+static void SaveMetadata(const State* state) {
+  MetaData data = {
+    static_cast<uint16_t>(state->Page)
+  };
+  PdfMetaSave(state->FilePath, data, state->MetaRootDir);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -600,10 +620,13 @@ static const char* HELP_STRING =
     "\t                      huge documents, or if you just want to reduce\n"
     "\t                      memory usage, you might want to set this to a\n"
     "\t                      smaller number.\n"
-    "\t--store_size=N        Set MuPDF store size limit to N MB (default 64).\n"
+    "\t--store_size=N        Set MuPDF store size limit to N MB (default 32).\n"
     "\t--guard_time=N        Time in milliseconds where input must be released\n"
     "\t                      to trigger a page change when moving up or down.\n"
     "\t                      Set to 0 to disable. Default 100.\n"
+    "\t--meta_dir=xx         Metadata relative root directory to store metadata file.\n"
+    "\t                      Should only be set if the common directory of documents is changed.\n"
+    "\t                      Default \"docs/\".'\n"
     "\n"
     "jfbview home page: https://github.com/jichu4n/jfbview\n"
     "Bug reports & suggestions: https://github.com/jichu4n/jfbview/issues\n"
@@ -622,6 +645,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
     FB,
     STATUS_FILE,
     PRINT_FB_DEBUG_INFO_AND_EXIT,
+    META_DIR,
   };
   // Command line options.
   static const option LongFlags[] = {
@@ -636,6 +660,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
       {"rotation", true, nullptr, 'r'},
       {"format", true, nullptr, 'f'},
       {"cache_size", true, nullptr, RENDER_CACHE_SIZE},
+      {"meta_dir", true, nullptr, META_DIR},
       {"fb_debug_info", false, nullptr, PRINT_FB_DEBUG_INFO_AND_EXIT},
       {"store_size", true, nullptr, STORE_SIZE},
       {"guard_time", true,  nullptr, GUARD_TIME},
@@ -693,6 +718,9 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
           exit(EXIT_FAILURE);
         }
         state->inputState.EdgeGuardTime = std::max(0, state->inputState.EdgeGuardTime);
+        break;
+      case META_DIR:
+        state->MetaRootDir = optarg;
         break;
       case 'p':
         if (sscanf(optarg, "%d", &(state->Page)) < 1) {
@@ -965,6 +993,8 @@ int main(int argc, char* argv[]) {
     exit(EXIT_FAILURE);
   }
 
+  LoadMetadata(&state);
+
   setlocale(LC_ALL, "");
   initscr();
   start_color();
@@ -1042,6 +1072,8 @@ int main(int argc, char* argv[]) {
       usleep(5000);
      }
   }
+
+  SaveMetadata(&state);
 
   // 3. Clean up.
   state.inputState.InputThreadExit.store(true, std::memory_order_relaxed);
