@@ -1,3 +1,18 @@
+PDFVIEWER
+=======
+**pdfviewer** is a MiSTer FPGA optomized version of **jfbview**.
+Changes include:
+  * Viewport clipped rendering optimizations
+  * Direct rendering to the linux framebuffer if cache_size = 1.
+  * Configurable limits of the MuPDF data store memory
+  * Removal of color modes
+  * PixelBuffer threaded memory access safeguards
+  * Per-page state memory
+  * Zoomed-in panning page turn guards
+  * Resume support
+  * Other Misc optimizations
+
+
 JFBVIEW
 =======
 
@@ -114,4 +129,3 @@ jfbview started as a fork of FBPDF by Ali Gholami Rudi with improvements and bug
 fixes, and was named JFBPDF. The JFBPDF code (in C) grew steadily more
 convoluted as features were added, and finally was completely rewritten from
 scratch in November 2012, with added support for images through Imlib2.
-
