@@ -80,6 +80,7 @@ class PixelBuffer {
 
   uint8_t* GetRawBuffer() const;
   int GetAllocatedStrideBytes() const;
+
  private:
   // Size of the buffer.
   Size _size;

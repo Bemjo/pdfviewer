@@ -53,9 +53,6 @@ class Framebuffer {
   // memory buffer, in pixels.
   PixelBuffer::Size GetOffset() const;
 
-  uint8_t* GetRawBuffer() const;
-  int GetFramebufferStride() const;
-
   // Renders a region in a pixel buffer onto the framebuffer device. The region
   // must be equal to or smaller than the screen size. If smaller, the source
   // rect is centered on screen.

@@ -53,7 +53,7 @@ class FitzDocument : public Document {
   // See Document.
   const PageSize GetPageSize(int page, float zoom, int rotation) override;
   // See Document. Thread-safe.
-  virtual bool Render(uint8_t* buffer, int stride_bytes,
+  virtual bool Render(uint8_t* buffer,
       int page, float zoom, int rotation,
       int clip_x, int clip_y, int clip_w, int clip_h) override;
   // See Document.
@@ -71,16 +71,21 @@ class FitzDocument : public Document {
  private:
   // MuPDF structures.
   fz_context* _fz_ctx;
+  fz_context* _worker_fz_ctx;  // cloned context for worker thread renders
   fz_document* _fz_doc;
   // Mutex guarding MuPDF structures.
-  std::recursive_mutex _fz_mutex;
+  std::mutex _fz_mutex;
+  // Locks provided to MuPDF for internal store thread safety.
+  std::unique_ptr<std::mutex[]> _fz_locks;
   // Displaylist Caching mechanism
   int _max_dl_cache_size;
   std::deque<int> _display_list_queue;
   std::unordered_map<int, fz_display_list*> _display_list_cache;
+  int _num_pages;
 
   // We disallow the constructor; use the factory method Open() instead.
-  FitzDocument(fz_context* _fz_context, fz_document* fz_document);
+  FitzDocument(fz_context* fz_ctx, fz_document* fz_doc,
+               std::unique_ptr<std::mutex[]> locks);
   // We disallow copying because we store lots of heap allocated state.
   explicit FitzDocument(const FitzDocument& other);
   FitzDocument& operator=(const FitzDocument& other);
@@ -88,6 +93,7 @@ class FitzDocument : public Document {
   fz_display_list* GetDisplayList(int page);
   void SetDLCacheSize(size_t size);
   void EvictFromDLCache();
+  void EvictFromDLCache_locked();
 };
 
 #endif

@@ -21,8 +21,6 @@
 
 #include "viewer.hpp"
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -39,52 +37,81 @@ Viewer::Viewer(
     : _doc(doc),
       _fb(fb),
       _state(state),
-      _render_cache(this, render_cache_size),
-      _last_page(-1) {
+      _cache_size(render_cache_size),
+      _last_rendered_page(-1),
+      _last_preloaded_page(-1),
+      _render_cache(this, render_cache_size) {
   assert(_doc != nullptr);
   assert(_fb != nullptr);
 }
 
 Viewer::~Viewer() {}
 
-void Viewer::Render() {
-  // 1. Process state.
-  int page = std::max(0, std::min(_doc->GetNumPages() - 1, _state.Page));
-
-  if (page != _last_page) {
-    auto it = _page_states.find(page);
-    if (it != _page_states.end()) {
-      _state.Zoom     = it->second.Zoom;
-      _state.XOffset  = it->second.XOffset;
-      _state.YOffset  = it->second.YOffset;
-      _state.Rotation = it->second.Rotation;
+float Viewer::ResolveZoom(
+    int page, float zoom, int rotation,
+    int screen_w, int screen_h) const {
+  if (zoom == ZOOM_TO_FIT || zoom == ZOOM_TO_WIDTH) {
+    const Document::PageSize ps = _doc->GetPageSize(page, 1.0f, rotation);
+    if (zoom == ZOOM_TO_WIDTH) {
+      zoom = static_cast<float>(screen_w) / static_cast<float>(ps.Width);
     } else {
-      _state.Zoom     = ZOOM_TO_FIT;
-      _state.XOffset  = 0;
-      _state.YOffset  = 0;
-      _state.Rotation = 0;
+      zoom = std::min(
+          static_cast<float>(screen_w) / static_cast<float>(ps.Width),
+          static_cast<float>(screen_h) / static_cast<float>(ps.Height));
     }
-    _last_page = page;
+  }
+  return std::max(MIN_ZOOM, std::min(MAX_ZOOM, zoom));
+}
+
+void Viewer::Render() {
+  // 1. Clamp page.
+  const int n = _doc->GetNumPages();
+  const int page = std::max(0, std::min(n - 1, _state.Page));
+  const bool refresh = (page == _last_rendered_page);
+
+  // early exit at trying to navigate past document boundaries.
+  if (refresh && _state.Page != page) {
+    _state.Page = page;
+    return;
   }
 
-  float zoom = _state.Zoom;
-  const PixelBuffer::Size& screen_size = _fb->GetSize();
-  const Document::PageSize& page_size = _doc->GetPageSize(page, 1.0f, _state.Rotation);
+  // 2. On navigation, manage the cache and restore per-page state.
+  if (!refresh) {
+    const int jump = (_last_rendered_page >= 0)
+                     ? std::abs(page - _last_rendered_page) : 0;
 
-  if (zoom == ZOOM_TO_WIDTH) {
-    zoom = static_cast<float>(screen_size.Width) / static_cast<float>(page_size.Width);
-  } else if (zoom == ZOOM_TO_FIT) {
-    zoom = std::min(
-        static_cast<float>(screen_size.Width) / static_cast<float>(page_size.Width),
-        static_cast<float>(screen_size.Height) / static_cast<float>(page_size.Height));
+    if (jump > _cache_size) {
+      _render_cache.Flush();
+      _last_preloaded_page = -1;
+    } else {
+      _render_cache.CancelOutsideRange(page - _cache_size, page + _cache_size);
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(_page_states_mutex);
+      auto it = _page_states.find(page);
+      if (it != _page_states.end()) {
+        _state.Zoom = it->second.Zoom;
+        _state.XOffset = it->second.XOffset;
+        _state.YOffset = it->second.YOffset;
+        _state.Rotation = it->second.Rotation;
+      } else {
+        _state.Zoom = ZOOM_TO_FIT;
+        _state.XOffset = 0;
+        _state.YOffset = 0;
+        _state.Rotation = 0;
+      }
+    }
   }
-  assert(zoom >= 0.0f);
-  zoom = std::max(MIN_ZOOM, std::min(MAX_ZOOM, zoom));
 
-  const Document::PageSize full_ps(
-      static_cast<int>(page_size.Width * zoom),
-      static_cast<int>(page_size.Height * zoom)
-  );
+  // 3. Compute viewport parameters.
+  const PixelBuffer::Size screen_size = _fb->GetSize();
+  const float zoom = ResolveZoom(
+      page, _state.Zoom, _state.Rotation,
+      screen_size.Width, screen_size.Height);
+
+  const Document::PageSize full_ps =
+      _doc->GetPageSize(page, zoom, _state.Rotation);
 
   const int max_x = std::max(0, full_ps.Width  - screen_size.Width);
   const int max_y = std::max(0, full_ps.Height - screen_size.Height);
@@ -93,27 +120,23 @@ void Viewer::Render() {
   const int vp_w  = std::min(screen_size.Width,  full_ps.Width  - src_x);
   const int vp_h  = std::min(screen_size.Height, full_ps.Height - src_y);
 
-  _page_states[page]  = PerPageState{_state.Zoom, src_x, src_y, _state.Rotation};
-
-  PixelBuffer::Rect src_rect(0, 0, vp_w, vp_h);
-
-  if (_render_cache.GetSize() > 1) {
-    // 2. Render page to buffer and cache.
-    std::shared_ptr<PixelBuffer> buffer = _render_cache.Get(
-        RenderCacheKey(page, zoom, _state.Rotation, src_x, src_y, vp_w, vp_h));
-        _fb->Render(*buffer, src_rect);
-
-    // Preload
-    if (page < _doc->GetNumPages() - 1) {
-      _render_cache.Prepare(
-          RenderCacheKey(page + 1, zoom, _state.Rotation, src_x, src_y, vp_w, vp_h));
-    }
-  } else {
-    // 2. Render directly into the framebuffer
-    _doc->Render(_fb->GetRawBuffer(), _fb->GetFramebufferStride(), page, zoom, _state.Rotation, src_x, src_y, vp_w, vp_h);
+  // 4. Write per-page state before touching the cache so the worker's
+  //    Load() always sees the latest zoom/pan/rotation for this page.
+  {
+    std::lock_guard<std::mutex> lock(_page_states_mutex);
+    _page_states[page] = PerPageState{_state.Zoom, src_x, src_y, _state.Rotation};
   }
 
-  // 4 . Store corrected state.
+  // 5. Retrieve from cache, or load if not present.
+  _render_cache.SetCenter(page);
+  std::shared_ptr<PixelBuffer> buffer = _render_cache.Get(page, refresh);
+
+  // 6. Blit to framebuffer.
+  _fb->Render(*buffer, PixelBuffer::Rect(0, 0, vp_w, vp_h));
+
+  _last_rendered_page = page;
+
+  // 7. Store corrected state.
   _state.Page = page;
   if ((_state.Zoom != ZOOM_TO_WIDTH) && (_state.Zoom != ZOOM_TO_FIT)) {
     _state.Zoom = zoom;
@@ -125,6 +148,26 @@ void Viewer::Render() {
   _state.PageHeight = full_ps.Height;
   _state.ScreenWidth = screen_size.Width;
   _state.ScreenHeight = screen_size.Height;
+
+  // 8. Schedule forward pre-caching once per page change (or after Flush).
+  //    Cache layout with effective size S = _cache_size + floor((_cache_size-2)/2):
+  //      1 slot  — current page
+  //      n-1 slots — prefetched forward pages
+  //      remaining slots — trailing pages retained naturally by FIFO eviction
+  if (_last_preloaded_page != page) {
+    _last_preloaded_page = page;
+
+    for (int i = 1; i <= _cache_size; ++i) {
+      const int fwd = page + i;
+      if (fwd < n && !_render_cache.Contains(fwd)) {
+        _render_cache.Prepare(fwd);
+      }
+      const int bwd = page - i;
+      if (bwd >= 0 && !_render_cache.Contains(bwd)) {
+        _render_cache.Prepare(bwd);
+      }
+    }
+  }
 }
 
 void Viewer::GetState(Viewer::State* state) const {
@@ -143,59 +186,66 @@ void Viewer::GetState(Viewer::State* state) const {
 
 void Viewer::SetState(const State& state) { _state = state; }
 
-bool Viewer::RenderCacheKey::operator<(
-    const Viewer::RenderCacheKey& other) const {
-  if (Page != other.Page) {
-    return Page < other.Page;
-  }
-  const int rotation_mod = Rotation % 360,
-            other_rotation_mod = other.Rotation % 360;
-  if (rotation_mod != other_rotation_mod) {
-    return rotation_mod < other_rotation_mod;
-  }
-  if (fabs(Zoom / other.Zoom - 1.0f) >= 0.001f) {
-    return Zoom < other.Zoom;
-  }
-  if (X != other.X) {
-    return X < other.X;
-  }
-  if (Y != other.Y) {
-    return Y < other.Y;
-  }
-  if (W != other.W) {
-    return W < other.W;
-  }
-  if (H != other.H) {
-    return H < other.H;
-  }
-  return false;
-}
-
 Viewer::RenderCache::RenderCache(Viewer* parent, int size)
-    : Cache<RenderCacheKey, std::shared_ptr<PixelBuffer>>(size), _parent(parent) {}
+    : Cache<int, std::shared_ptr<PixelBuffer>>(size), _parent(parent) {}
 
 Viewer::RenderCache::~RenderCache() { Clear(); }
 
-std::shared_ptr<PixelBuffer> Viewer::RenderCache::Load(const RenderCacheKey& key) {
-  std::shared_ptr<PixelBuffer> buffer(_parent->_fb->NewPixelBuffer(
-      PixelBuffer::Size(key.W, key.H)));
+bool Viewer::RenderCache::EvictBefore(
+    const int& a, const int& b, const int& center) const {
+  return std::abs(a - center) > std::abs(b - center);
+}
 
+std::shared_ptr<PixelBuffer> Viewer::RenderCache::Load(const int& page) {
+  // Read per-page params under the mutex for as short a time as possible.
+  Viewer::PerPageState params;
+  bool found;
+  {
+    std::lock_guard<std::mutex> lock(_parent->_page_states_mutex);
+    auto it = _parent->_page_states.find(page);
+    found = (it != _parent->_page_states.end());
+    if (found) {
+      params = it->second;
+    }
+  }
+
+  const PixelBuffer::Size screen = _parent->_fb->GetSize();
+  const float zoom_raw = found ? params.Zoom     : Viewer::ZOOM_TO_FIT;
+  const int   rotation = found ? params.Rotation : 0;
+  const float zoom = _parent->ResolveZoom(
+      page, zoom_raw, rotation, screen.Width, screen.Height);
+
+  const Document::PageSize full_ps =
+      _parent->_doc->GetPageSize(page, zoom, rotation);
+
+  const int x_raw = found ? params.XOffset : 0;
+  const int y_raw = found ? params.YOffset : 0;
+  const int max_x = std::max(0, full_ps.Width  - screen.Width);
+  const int max_y = std::max(0, full_ps.Height - screen.Height);
+  const int src_x = std::max(0, std::min(max_x, x_raw));
+  const int src_y = std::max(0, std::min(max_y, y_raw));
+  const int vp_w  = std::min(screen.Width,  full_ps.Width  - src_x);
+  const int vp_h  = std::min(screen.Height, full_ps.Height - src_y);
+
+  std::shared_ptr<PixelBuffer> buffer(
+      _parent->_fb->NewPixelBuffer(PixelBuffer::Size(vp_w, vp_h)));
   _parent->_doc->Render(
-      buffer->GetRawBuffer(), buffer->GetAllocatedStrideBytes(),
-      key.Page, key.Zoom, key.Rotation, key.X, key.Y, key.W, key.H);
-
+      buffer->GetRawBuffer(), page, zoom, rotation, src_x, src_y, vp_w, vp_h);
   return buffer;
 }
 
 void Viewer::RenderCache::Discard(
-    const RenderCacheKey& key, const std::shared_ptr<PixelBuffer>& value) {
+    const int& page, const std::shared_ptr<PixelBuffer>& value) {
+  (void)page;
+  (void)value;
+  // shared_ptr handles memory; nothing to do.
 }
 
 Viewer::PerPageState Viewer::GetPageState(int page) {
+  std::lock_guard<std::mutex> lock(_page_states_mutex);
   if (page < 0) {
     return _page_states[_state.Page];
   }
-
-  page = std::min(page, _state.NumPages);
+  page = std::min(page, _state.NumPages - 1);
   return _page_states[page];
 }

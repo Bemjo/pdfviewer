@@ -70,30 +70,33 @@
 
 struct InputState {
   enum {DEFAULT_PAGE_EDGE_TIME = 100 };
+  enum EdgeState
+  {
+      EDGE_IDLE,
+
+      EDGE_WAIT_UP_RELEASE,
+      EDGE_WAIT_DOWN_RELEASE,
+
+      EDGE_READY_UP,
+      EDGE_READY_DOWN,
+  };
 
   int EdgeGuardTime;
-  std::atomic<bool> AtPageEdge;
-  std::atomic<bool> EdgeReleased;
-  // +1 = down edge, -1 = up edge, 0 = none
-  std::atomic<int> EdgeDirection;
+  std::atomic<EdgeState> CurrEdgeState;
   std::atomic<bool> InputThreadExit;
   std::atomic<int> InputKey;
   std::atomic<int> InputRepeat;
+  std::atomic<int> HeldKey;
+  std::atomic<int> ClearHeldKey;
 
   InputState()
-      : EdgeGuardTime(InputState::DEFAULT_PAGE_EDGE_TIME),
-        AtPageEdge(false),
-        EdgeReleased(false),
-        EdgeDirection(0),
+      : EdgeGuardTime(DEFAULT_PAGE_EDGE_TIME),
+        CurrEdgeState(EDGE_IDLE),
         InputThreadExit(false),
         InputKey(ERR),
-        InputRepeat(Command::NO_REPEAT) {}
-
-  void ClearPageGuard() {
-    AtPageEdge.store(false, std::memory_order_relaxed);
-    EdgeReleased.store(false, std::memory_order_relaxed);
-    EdgeDirection.store(0, std::memory_order_relaxed);
-  }
+        InputRepeat(Command::NO_REPEAT),
+        HeldKey(ERR),
+        ClearHeldKey(ERR) {}
 };
 
 // Main program state.
@@ -283,23 +286,20 @@ class MoveDownCommand : public MoveCommand {
 
     if (at_bottom) {
       if (state->Zoom > 0 && state->PageHeight > state->ScreenHeight) {
-        if (state->inputState.EdgeReleased.exchange(false, std::memory_order_relaxed)) {
+        if (state->inputState.CurrEdgeState.exchange(InputState::EDGE_IDLE, std::memory_order_relaxed) == InputState::EDGE_READY_DOWN) {
           if (++(state->Page) < state->NumPages) {
             state->YOffset = 0;
           }
         } else {
-          state->inputState.AtPageEdge.store(true, std::memory_order_relaxed);
-          state->inputState.EdgeDirection.store(1, std::memory_order_relaxed);
+          state->inputState.CurrEdgeState.store(InputState::EDGE_WAIT_DOWN_RELEASE, std::memory_order_relaxed);
+          state->Render = false;
         }
-      } else {
-        if (++(state->Page) < state->NumPages) {
-          state->YOffset = 0;
-        }
-        state->inputState.ClearPageGuard();
+        return;
+      } else if (++(state->Page) < state->NumPages) {
+        state->YOffset = 0;
       }
-    } else {
-      state->inputState.ClearPageGuard();
     }
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -312,23 +312,20 @@ class MoveUpCommand : public MoveCommand {
 
     if (at_top) {
       if (state->Zoom > 0 && state->PageHeight > state->ScreenHeight) {
-        if (state->inputState.EdgeReleased.exchange(false, std::memory_order_relaxed)) {
+        if (state->inputState.CurrEdgeState.exchange(InputState::EDGE_IDLE, std::memory_order_relaxed) == InputState::EDGE_READY_UP) {
           if (--(state->Page) >= 0) {
             state->YOffset = INT_MAX;
           }
         } else {
-          state->inputState.AtPageEdge.store(true, std::memory_order_relaxed);
-          state->inputState.EdgeDirection.store(-1, std::memory_order_relaxed);
+          state->inputState.CurrEdgeState.store(InputState::EDGE_WAIT_UP_RELEASE, std::memory_order_relaxed);
+          state->Render = false;
         }
-      } else {
-        if (--(state->Page) >= 0) {
-          state->YOffset = INT_MAX;
-        }
-        state->inputState.ClearPageGuard();
+        return;
+      } else if (--(state->Page) >= 0) {
+        state->YOffset = INT_MAX;
       }
-    } else {
-      state->inputState.ClearPageGuard();
     }
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -336,7 +333,7 @@ class MoveLeftCommand : public MoveCommand {
  public:
   void Execute(int repeat, State* state) override {
     state->XOffset -= RepeatOrDefault(repeat, 1) * GetMoveSize(state, true);
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -344,7 +341,7 @@ class MoveRightCommand : public MoveCommand {
  public:
   void Execute(int repeat, State* state) override {
     state->XOffset += RepeatOrDefault(repeat, 1) * GetMoveSize(state, true);
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -358,7 +355,7 @@ class ScreenDownCommand : public Command {
         state->YOffset = 0;
       }
     }
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -371,7 +368,7 @@ class ScreenUpCommand : public Command {
         state->YOffset = INT_MAX;
       }
     }
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -379,7 +376,7 @@ class PageDownCommand : public Command {
  public:
   void Execute(int repeat, State* state) override {
     state->Page += RepeatOrDefault(repeat, 1);
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -387,7 +384,7 @@ class PageUpCommand : public Command {
  public:
   void Execute(int repeat, State* state) override {
     state->Page -= RepeatOrDefault(repeat, 1);
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -419,8 +416,9 @@ class ZoomCommand : public Command {
     state->XOffset = static_cast<int>(new_center_x) - state->ScreenWidth / 2;
     state->YOffset = static_cast<int>(new_center_y) - state->ScreenHeight / 2;
     // New zoom.
+    state->Render = std::abs(state->Zoom - zoom) > 0.00001f;
     state->Zoom = zoom;
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 const float ZoomCommand::ZOOM_COEFFICIENT = 1.2f;
@@ -454,7 +452,7 @@ class SetRotationCommand : public Command {
  public:
   void Execute(int repeat, State* state) override {
     state->Rotation = RepeatOrDefault(repeat, 0);
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -464,7 +462,7 @@ class RotateCommand : public Command {
 
   void Execute(int repeat, State* state) override {
     state->Rotation += RepeatOrDefault(repeat, 1) * _increment;
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 
  private:
@@ -475,7 +473,7 @@ class ZoomToFitCommand : public Command {
  public:
   void Execute(int repeat, State* state) override {
     state->Zoom = Viewer::ZOOM_TO_FIT;
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 };
 
@@ -510,7 +508,7 @@ class GoToPageCommand : public Command {
       state->XOffset = 0;
       state->YOffset = 0;
     }
-    state->inputState.ClearPageGuard();
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 
  private:
@@ -577,7 +575,7 @@ class ReloadCommand : public StateCommand {
       state->ViewerInst = std::make_unique<Viewer>(
           state->DocumentInst.get(), state->FramebufferInst.get(), *state,
           state->RenderCacheSize);
-      state->inputState.ClearPageGuard();
+      state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
     } else {
       state->Exit = true;
     }
@@ -703,7 +701,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
           fprintf(stderr, "Invalid render cache size \"%s\"\n", optarg);
           exit(EXIT_FAILURE);
         }
-        state->RenderCacheSize = std::max(1, state->RenderCacheSize + 1);
+        state->RenderCacheSize = std::max(1, state->RenderCacheSize);
         break;
       case STORE_SIZE:
         if (sscanf(optarg, "%d", &(state->MuPDFStoreSize)) < 0) {
@@ -869,10 +867,33 @@ out:
   close(fd);
 }
 
+static long ElapsedMilliseconds(const timespec& start, const timespec& end) {
+  return (end.tv_sec - start.tv_sec) * 1000 +
+         (end.tv_nsec - start.tv_nsec) / 1000000;
+}
+
+static void ResetReleaseTimer(bool* timing_release, timespec* release_start) {
+  *timing_release = false;
+  *release_start = {0, 0};
+}
+
+static void ClearBufferedHeldInput(InputState* state, int key) {
+  int expected = key;
+  if (state->InputKey.compare_exchange_strong(
+          expected, ERR, std::memory_order_relaxed)) {
+    state->InputRepeat.store(Command::NO_REPEAT, std::memory_order_relaxed);
+  }
+  flushinp();
+}
+
 static void InputThread(InputState* state) {
   timespec now                = {0, 0};
   timespec edge_release_start = {0, 0};
+  timespec hold_release_start = {0, 0};
   bool     timing_release     = false;
+  bool     timing_hold_release = false;
+  int      tracked_key        = ERR;
+  bool     tracked_key_held   = false;
   int      repeat             = Command::NO_REPEAT;
 
   for (;;) {
@@ -880,19 +901,26 @@ static void InputThread(InputState* state) {
       return;
     }
 
+    const int clear_key = state->ClearHeldKey.exchange(ERR, std::memory_order_relaxed);
+    if (clear_key != ERR &&
+        state->HeldKey.load(std::memory_order_relaxed) == clear_key) {
+      ClearBufferedHeldInput(state, clear_key);
+    }
+
     int key = getch();
 
-    if (state->AtPageEdge.load(std::memory_order_relaxed)) {
-      const int  edge_dir    = state->EdgeDirection.load(std::memory_order_relaxed);
-      const bool key_matches = (edge_dir > 0 && (key == KEY_DOWN || key == 'j')) ||
-                               (edge_dir < 0 && (key == KEY_UP   || key == 'k'));
-      if (key != ERR && !key_matches) {
-        state->ClearPageGuard();
+    // Handle page edge guard timing
+    InputState::EdgeState currState = state->CurrEdgeState.load(std::memory_order_relaxed);
+
+    if (currState == InputState::EDGE_WAIT_UP_RELEASE || currState == InputState::EDGE_WAIT_DOWN_RELEASE) {
+      const bool match_down = currState == InputState::EDGE_WAIT_DOWN_RELEASE && (key == KEY_DOWN || key == 'j');
+      const bool match_up = currState == InputState::EDGE_WAIT_UP_RELEASE && (key == KEY_UP || key == 'k');
+
+      if (key != ERR && !(match_down || match_up)) {
+        state->CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
         timing_release     = false;
         edge_release_start = {0, 0};
       } else {
-        repeat = Command::NO_REPEAT;
-        state->InputKey.store(ERR, std::memory_order_relaxed);
         if (key != ERR) {
           timing_release     = false;
           edge_release_start = {0, 0};
@@ -902,39 +930,73 @@ static void InputThread(InputState* state) {
         } else {
           clock_gettime(CLOCK_MONOTONIC, &now);
           const long elapsed_ms =
-              (now.tv_sec  - edge_release_start.tv_sec)  * 1000 +
-               (now.tv_nsec - edge_release_start.tv_nsec) / 1000000;
+              ElapsedMilliseconds(edge_release_start, now);
           if (elapsed_ms >= state->EdgeGuardTime) {
-            state->AtPageEdge.store(false, std::memory_order_relaxed);
-            state->EdgeReleased.store(true, std::memory_order_relaxed);
+            if (currState == InputState::EDGE_WAIT_UP_RELEASE) {
+              state->CurrEdgeState.store(InputState::EDGE_READY_UP, std::memory_order_relaxed);
+            } else {
+              state->CurrEdgeState.store(InputState::EDGE_READY_DOWN, std::memory_order_relaxed);
+            }
             timing_release     = false;
             edge_release_start = {0, 0};
           }
         }
-        usleep(10000);
+        usleep(2000);
         continue;
       }
     } else {
-      timing_release     = false;
-      edge_release_start = {0, 0};
+      ResetReleaseTimer(&timing_release, &edge_release_start);
     }
 
-    if (isdigit(key)) {
-      nodelay(stdscr, false);
-      do {
-        if (repeat == Command::NO_REPEAT) {
-          repeat = key - '0';
-        } else {
-          repeat = repeat * 10 + key - '0';
+    if (key != ERR) {
+      if (isdigit(key)) {
+        nodelay(stdscr, false);
+        do {
+          if (repeat == Command::NO_REPEAT) {
+            repeat = key - '0';
+          } else {
+            repeat = repeat * 10 + key - '0';
+          }
+        } while (isdigit(key = getch()));
+        nodelay(stdscr, true);
+        state->InputRepeat.store(repeat, std::memory_order_relaxed);
+      }
+
+      if (key == tracked_key) {
+        tracked_key_held = true;
+        state->HeldKey.store(key, std::memory_order_relaxed);
+      } else {
+        tracked_key = key;
+        tracked_key_held = false;
+        state->HeldKey.store(ERR, std::memory_order_relaxed);
+      }
+      ResetReleaseTimer(&timing_hold_release, &hold_release_start);
+
+      repeat = Command::NO_REPEAT;
+      int current = state->InputKey.load(std::memory_order_relaxed);
+      if (key != current) {
+        state->InputKey.store(key, std::memory_order_relaxed);
+      }
+    } else if (tracked_key != ERR) {
+      if (!timing_hold_release) {
+        clock_gettime(CLOCK_MONOTONIC, &hold_release_start);
+        timing_hold_release = true;
+      } else {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const long elapsed_ms =
+            ElapsedMilliseconds(hold_release_start, now);
+        if (elapsed_ms >= state->EdgeGuardTime) {
+          if (tracked_key_held) {
+            ClearBufferedHeldInput(state, tracked_key);
+          }
+          state->HeldKey.store(ERR, std::memory_order_relaxed);
+          tracked_key = ERR;
+          tracked_key_held = false;
+          ResetReleaseTimer(&timing_hold_release, &hold_release_start);
         }
-      } while (isdigit(key = getch()));
-      nodelay(stdscr, true);
-      state->InputRepeat.store(repeat, std::memory_order_relaxed);
+      }
     }
-    repeat = Command::NO_REPEAT;
-    state->InputKey.store(key, std::memory_order_relaxed);
-
-    usleep(10000);
+    usleep(2000);
   }
 }
 
@@ -1009,8 +1071,6 @@ int main(int argc, char* argv[]) {
   // to getch().
   refresh();
 
-
-
   state.ViewerInst = std::make_unique<Viewer>(
       state.DocumentInst.get(), state.FramebufferInst.get(), state,
       state.RenderCacheSize);
@@ -1065,12 +1125,15 @@ int main(int argc, char* argv[]) {
     if (last != ERR) {
       if (last != KEY_RESIZE) {
         const int repeat = state.inputState.InputRepeat.exchange(Command::NO_REPEAT, std::memory_order_relaxed);
+        if (state.inputState.HeldKey.load(std::memory_order_relaxed) == last) {
+          state.inputState.ClearHeldKey.store(last, std::memory_order_relaxed);
+        }
+        state.Render = true;
         registry->Dispatch(last, repeat, &state);
       }
-      state.Render = true;
     } else {
-      usleep(5000);
-     }
+      usleep(2000);
+    }
   }
 
   SaveMetadata(&state);
@@ -1078,6 +1141,7 @@ int main(int argc, char* argv[]) {
   // 3. Clean up.
   state.inputState.InputThreadExit.store(true, std::memory_order_relaxed);
   input_thread.join();
+  state.ViewerInst.reset();
   state.SearchViewInst.reset();
   state.OutlineViewInst.reset();
   // Hack alert: Calling endwin() immediately after the framebuffer destructor
@@ -1086,7 +1150,6 @@ int main(int argc, char* argv[]) {
   // short sleep appears to fix the issue.
   state.DocumentInst.reset();
   state.FramebufferInst.reset();
-  state.ViewerInst.reset();
   usleep(100 * 1000);
   endwin();
 

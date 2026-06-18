@@ -3,7 +3,6 @@ PDFVIEWER
 **pdfviewer** is a MiSTer FPGA optomized version of **jfbview**.
 Changes include:
   * Viewport clipped rendering optimizations
-  * Direct rendering to the linux framebuffer if cache_size = 1.
   * Configurable limits of the MuPDF data store memory
   * Removal of color modes
   * PixelBuffer threaded memory access safeguards
