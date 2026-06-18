@@ -22,15 +22,29 @@
 #include "fitz_document.hpp"
 
 #include <cassert>
+#include <stdio.h>
 
 #include "string_utils.hpp"
+
+static void fz_lock_mutex(void* user, int lock) {
+  reinterpret_cast<std::mutex*>(user)[lock].lock();
+}
+static void fz_unlock_mutex(void* user, int lock) {
+  reinterpret_cast<std::mutex*>(user)[lock].unlock();
+}
 
 FitzDocument* FitzDocument::Open(const std::string& path, const std::string* password,
     size_t max_store_size_mb, size_t dl_cache_size) {
   size_t store_size = (max_store_size_mb == 0)
                         ? FZ_STORE_DEFAULT
                         : max_store_size_mb * 1024 * 1024;
-  fz_context* fz_ctx = fz_new_context(nullptr, nullptr, store_size);
+
+  auto locks = std::make_unique<std::mutex[]>(FZ_LOCK_MAX);
+  fz_locks_context locks_ctx = {
+      locks.get(), fz_lock_mutex, fz_unlock_mutex
+  };
+
+  fz_context* fz_ctx = fz_new_context(nullptr, &locks_ctx, store_size);
   fz_set_aa_level(fz_ctx, 2);
   fz_register_document_handlers(fz_ctx);
   // Disable warning messages in the console.
@@ -70,14 +84,13 @@ FitzDocument* FitzDocument::Open(const std::string& path, const std::string* pas
     return nullptr;
   }
 
-  FitzDocument* doc = new FitzDocument(fz_ctx, fz_doc);
+  FitzDocument* doc = new FitzDocument(fz_ctx, fz_doc, std::move(locks));
   doc->SetDLCacheSize(dl_cache_size);
   return doc;
 }
 
 void FitzDocument::EvictFromDLCache() {
-std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
-if (_display_list_cache.size() > 0 && _display_list_queue.size() > 0) {
+  if (_display_list_cache.size() > 0 && _display_list_queue.size() > 0) {
     int p = _display_list_queue.front();
     _display_list_queue.pop_front();
     auto it = _display_list_cache.find(p);
@@ -89,7 +102,7 @@ if (_display_list_cache.size() > 0 && _display_list_queue.size() > 0) {
 }
 
 void FitzDocument::SetDLCacheSize(size_t size) {
-  std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
+  std::lock_guard<std::mutex> lock(_fz_mutex);
   while (_display_list_cache.size() > size) {
     EvictFromDLCache();
   }
@@ -97,30 +110,34 @@ void FitzDocument::SetDLCacheSize(size_t size) {
   _max_dl_cache_size = size;
 }
 
-FitzDocument::FitzDocument(fz_context* fz_ctx, fz_document* fz_doc)
-    : _fz_ctx(fz_ctx), _fz_doc(fz_doc) {
+FitzDocument::FitzDocument(fz_context* fz_ctx, fz_document* fz_doc,
+                           std::unique_ptr<std::mutex[]> locks)
+    : _fz_ctx(fz_ctx), _fz_doc(fz_doc), _fz_locks(std::move(locks)) {
   assert(_fz_ctx != nullptr);
   assert(_fz_doc != nullptr);
+  _num_pages = fz_count_pages(_fz_ctx, _fz_doc);
+  _worker_fz_ctx = fz_clone_context(_fz_ctx);
 }
 
 FitzDocument::~FitzDocument() {
-  std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
+  std::lock_guard<std::mutex> lock(_fz_mutex);
   for (auto& kv : _display_list_cache) {
     fz_drop_display_list(_fz_ctx, kv.second);
   }
+  fz_drop_context(_worker_fz_ctx);
   fz_drop_document(_fz_ctx, _fz_doc);
   fz_drop_context(_fz_ctx);
 }
 
 int FitzDocument::GetNumPages() {
-  std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
+  std::lock_guard<std::mutex> lock(_fz_mutex);
   return fz_count_pages(_fz_ctx, _fz_doc);
 }
 
 const Document::PageSize FitzDocument::GetPageSize(
     int page, float zoom, int rotation) {
-  std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
-  assert((page >= 0) && (page < GetNumPages()));
+  std::lock_guard<std::mutex> lock(_fz_mutex);
+  assert((page >= 0) && (page < _num_pages));
   const fz_matrix& m = ComputeTransformMatrix(zoom, rotation);
   fz_display_list* display_list = GetDisplayList(page);
   fz_rect bounds = fz_bound_display_list(_fz_ctx, display_list);
@@ -129,64 +146,60 @@ const Document::PageSize FitzDocument::GetPageSize(
 }
 
 fz_display_list* FitzDocument::GetDisplayList(int page) {
-  std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
   auto it = _display_list_cache.find(page);
   if (it != _display_list_cache.end()) {
     return it->second;
   }
-
-  // Evict display list from cache
   if (_display_list_cache.size() >= _max_dl_cache_size) {
     EvictFromDLCache();
   }
-
   FitzPageScopedPtr pp(_fz_ctx, fz_load_page(_fz_ctx, _fz_doc, page));
   fz_display_list* display_list = fz_new_display_list_from_page(_fz_ctx, pp.get());
-
   _display_list_cache[page] = display_list;
   _display_list_queue.push_back(page);
   return display_list;
 }
 
+
 bool FitzDocument::Render(
-    uint8_t* buffer, int stride_bytes, int page, float zoom, int rotation,
+    uint8_t* buffer, int page, float zoom, int rotation,
     int clip_x, int clip_y, int clip_w, int clip_h) {
-  std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
-  assert((page >= 0) && (page < GetNumPages()));
-
-  // 1. Init MuPDF structures.
-  const fz_matrix& m = ComputeTransformMatrix(zoom, rotation);
-  fz_display_list* display_list = GetDisplayList(page);
-  fz_rect bounds = fz_bound_display_list(_fz_ctx, display_list);
-  fz_irect bbox, full_bbox = fz_round_rect(fz_transform_rect(bounds, m));
-
-  bbox.x0 = std::max(full_bbox.x0, full_bbox.x0 + clip_x);
-  bbox.y0 = std::max(full_bbox.y0, full_bbox.y0 + clip_y);
-  bbox.x1 = std::min(full_bbox.x1, bbox.x0 + clip_w);
-  bbox.y1 = std::min(full_bbox.y1, bbox.y0 + clip_h);
-
-  if (stride_bytes != (bbox.x1 - bbox.x0) * 4) {
-    return false;
+  // Phase 1: get display list and compute geometry under lock.
+  fz_display_list* display_list;
+  fz_matrix m;
+  fz_irect bbox;
+  {
+    std::lock_guard<std::mutex> lock(_fz_mutex);
+    assert((page >= 0) && (page < _num_pages));
+    m = ComputeTransformMatrix(zoom, rotation);
+    display_list = GetDisplayList(page);
+    fz_rect bounds = fz_bound_display_list(_fz_ctx, display_list);
+    fz_irect full_bbox = fz_round_rect(fz_transform_rect(bounds, m));
+    bbox.x0 = std::max(full_bbox.x0, full_bbox.x0 + clip_x);
+    bbox.y0 = std::max(full_bbox.y0, full_bbox.y0 + clip_y);
+    bbox.x1 = std::min(full_bbox.x1, bbox.x0 + clip_w);
+    bbox.y1 = std::min(full_bbox.y1, bbox.y0 + clip_h);
+    // Hold a reference so the display list cannot be evicted during Phase 2.
+    fz_keep_display_list(_fz_ctx, display_list);
   }
 
+  // Phase 2: rasterize without lock using the worker context.
   FitzPixmapScopedPtr pixmap_ptr(
-      _fz_ctx, fz_new_pixmap_with_bbox_and_data(
-                   _fz_ctx, fz_device_bgr(_fz_ctx), bbox, nullptr, 1, buffer));
+      _worker_fz_ctx, fz_new_pixmap_with_bbox_and_data(
+                   _worker_fz_ctx, fz_device_bgr(_worker_fz_ctx), bbox, nullptr, 1, buffer));
   FitzDeviceScopedPtr dev_ptr(
-      _fz_ctx, fz_new_draw_device(_fz_ctx, fz_identity, pixmap_ptr.get()));
-
-  // 2. Render page.
-  fz_clear_pixmap_with_value(_fz_ctx, pixmap_ptr.get(), 0xff);
+      _worker_fz_ctx, fz_new_draw_device(_worker_fz_ctx, fz_identity, pixmap_ptr.get()));
+  fz_clear_pixmap_with_value(_worker_fz_ctx, pixmap_ptr.get(), 0xff);
   fz_rect clip_rect = fz_rect_from_irect(bbox);
-  fz_run_display_list(_fz_ctx, display_list, dev_ptr.get(), m, clip_rect, nullptr);
-  // 4. Clean up.
-  fz_close_device(_fz_ctx, dev_ptr.get());
+  fz_run_display_list(_worker_fz_ctx, display_list, dev_ptr.get(), m, clip_rect, nullptr);
+  fz_close_device(_worker_fz_ctx, dev_ptr.get());
+  fz_drop_display_list(_worker_fz_ctx, display_list);
 
   return true;
 }
 
 const Document::OutlineItem* FitzDocument::GetOutline() {
-  std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
+  std::lock_guard<std::mutex> lock(_fz_mutex);
   FitzOutlineScopedPtr outline_ptr(_fz_ctx, fz_load_outline(_fz_ctx, _fz_doc));
   if (outline_ptr.get() == nullptr) {
     return nullptr;
@@ -200,7 +213,7 @@ int FitzDocument::Lookup(const OutlineItem* item) {
 }
 
 std::string FitzDocument::GetPageText(int page, int line_sep) {
-  std::lock_guard<std::recursive_mutex> lock(_fz_mutex);
+  std::lock_guard<std::mutex> lock(_fz_mutex);
   FitzPageScopedPtr page_ptr(_fz_ctx, fz_load_page(_fz_ctx, _fz_doc, page));
   return ::GetPageText(_fz_ctx, page_ptr.get(), line_sep);
 }

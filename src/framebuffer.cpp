@@ -130,14 +130,6 @@ PixelBuffer::Size Framebuffer::GetOffset() const {
   return PixelBuffer::Size(_vinfo.xoffset, _vinfo.yoffset);
 }
 
-uint8_t* Framebuffer::GetRawBuffer() const {
-  return _buffer;
-}
-
-int Framebuffer::GetFramebufferStride() const {
-  return _finfo.line_length;
-}
-
 void Framebuffer::Render(
     const PixelBuffer& src, const PixelBuffer::Rect& rect) {
   src.Copy(rect, _pixel_buffer->GetRect(), _pixel_buffer.get());

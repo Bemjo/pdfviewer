@@ -24,6 +24,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 
 #include "cache.hpp"
 
@@ -126,45 +127,40 @@ class Viewer {
   Framebuffer* _fb;
   // Settings.
   State _state;
+  // Total cache capacity.
+  int _cache_size;
 
-  int _last_page;
+  // Per-page zoom/pan/rotation state. Protected by _page_states_mutex so
+  // background Load() threads can read safely while the main thread writes.
   std::map<int, PerPageState> _page_states;
+  std::mutex _page_states_mutex;
 
-  // Key to the render cache.
-  struct RenderCacheKey {
-    // Page number, starting from 0.
-    int Page;
-    // Zoom ratio at which the buffer was rendered. This must be the actual
-    // ratio, and NOT one of the ZOOM_* constants.
-    float Zoom;
-    // Rotation in clockwise degrees.
-    int Rotation;
+  // Page rendered on the last Render() call. Used to detect navigation vs
+  // in-page param changes.
+  int _last_rendered_page;
+  // Page for which adjacent Prepare() calls were last scheduled.
+  int _last_preloaded_page;
 
-    int X, Y;
-    int W, H;
-
-    RenderCacheKey(
-        int page, float zoom, int rotation, int x, int y, int w, int h)
-        : Page(page), Zoom(zoom), Rotation(rotation), X(x), Y(y), W(w), H(h) {}
-
-    // This is required as this class will be inserted into a map.
-    bool operator<(const RenderCacheKey& other) const;
-  };
-  // Render cache class.
-  class RenderCache : public Cache<RenderCacheKey, std::shared_ptr<PixelBuffer>> {
+  // Render cache: key is page number, value is the rendered viewport buffer.
+  class RenderCache : public Cache<int, std::shared_ptr<PixelBuffer>> {
    public:
     RenderCache(Viewer* parent, int size);
     virtual ~RenderCache();
 
    protected:
-    std::shared_ptr<PixelBuffer> Load(const RenderCacheKey& key) override;
-    void Discard(const RenderCacheKey& key, const std::shared_ptr<PixelBuffer>& value) override;
+    std::shared_ptr<PixelBuffer> Load(const int& page) override;
+    void Discard(const int& page,
+                 const std::shared_ptr<PixelBuffer>& value) override;
+    bool EvictBefore(const int& a, const int& b, const int& center) const override;
 
    private:
     Viewer* _parent;
   };
-  // Render cache.
   RenderCache _render_cache;
+
+  // Resolves ZOOM_TO_FIT / ZOOM_TO_WIDTH for the given page and screen size.
+  float ResolveZoom(int page, float zoom, int rotation,
+                    int screen_w, int screen_h) const;
 };
 
 #endif
