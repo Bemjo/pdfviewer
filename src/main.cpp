@@ -120,6 +120,11 @@ struct State : public Viewer::State {
   int RenderCacheSize;
   // Maximum cache store size in bytes for MuPDF
   int MuPDFStoreSize;
+  // Maximum render buffer size.
+  int RenderCapWidth;
+  int RenderCapHeight;
+  // Upscaling algorithm (0=nearest, 1=bilinear, 2=bicubic).
+  PixelBuffer::ScaleMode RenderScaleMode;
 
   // Input file.
   std::string FilePath;
@@ -154,6 +159,9 @@ struct State : public Viewer::State {
         DocumentType(AUTO_DETECT),
         RenderCacheSize(Viewer::DEFAULT_RENDER_CACHE_SIZE),
         MuPDFStoreSize(FitzDocument::DEFAULT_STORE_SIZE),
+        RenderCapWidth(Viewer::DEFAULT_MAX_RENDER_WIDTH),
+        RenderCapHeight(Viewer::DEFAULT_MAX_RENDER_HEIGHT),
+        RenderScaleMode(PixelBuffer::SCALE_BILINEAR),
         FilePath(""),
         FilePassword(),
         FramebufferDevice(Framebuffer::DEFAULT_FRAMEBUFFER_DEVICE),
@@ -396,11 +404,15 @@ class ZoomCommand : public Command {
   // Sets zoom, preserving original screen center.
   void SetZoom(float zoom, State* state) {
     // Position in page of screen center, as fraction of page size.
+    // When the page is smaller than the screen it is centered, so the
+    // visible page width/height is min(Screen,Page) in each axis.
+    const int vis_w = std::min(state->ScreenWidth,  state->PageWidth);
+    const int vis_h = std::min(state->ScreenHeight, state->PageHeight);
     const float center_ratio_x =
-        static_cast<float>(state->XOffset + state->ScreenWidth / 2) /
+        static_cast<float>(state->XOffset + vis_w / 2) /
         static_cast<float>(state->PageWidth);
     const float center_ratio_y =
-        static_cast<float>(state->YOffset + state->ScreenHeight / 2) /
+        static_cast<float>(state->YOffset + vis_h / 2) /
         static_cast<float>(state->PageHeight);
     // Bound zoom.
     zoom = std::max(Viewer::MIN_ZOOM, std::min(Viewer::MAX_ZOOM, zoom));
@@ -574,12 +586,29 @@ class ReloadCommand : public StateCommand {
     if (LoadFile(state)) {
       state->ViewerInst = std::make_unique<Viewer>(
           state->DocumentInst.get(), state->FramebufferInst.get(), *state,
-          state->RenderCacheSize);
+          state->RenderCacheSize, state->RenderScaleMode,
+          state->RenderCapWidth, state->RenderCapHeight);
       state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
     } else {
       state->Exit = true;
     }
   }
+};
+
+class CycleScaleModeCommand : public Command {
+ public:
+  explicit CycleScaleModeCommand(int direction) : _direction(direction) {}
+
+  void Execute(int repeat, State* state) override {
+    const int n = static_cast<int>(PixelBufer::ScaleMode::SCALER_COUNT);
+    const int mode = (static_cast<int>(state->RenderScaleMode) + _direction + n) % n;
+    state->RenderScaleMode = static_cast<PixelBuffer::ScaleMode>(mode);
+    state->ViewerInst->SetScaleMode(state->RenderScaleMode);
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
+  }
+
+ private:
+  int _direction;
 };
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -622,6 +651,13 @@ static const char* HELP_STRING =
     "\t--guard_time=N        Time in milliseconds where input must be released\n"
     "\t                      to trigger a page change when moving up or down.\n"
     "\t                      Set to 0 to disable. Default 100.\n"
+    "\t--render_cap=WxH      Cap the MuPDF render buffer to WxH pixels, e.g.\n"
+    "\t                      1280x720 or 960x480. Frames larger than this are\n"
+    "\t                      rendered at the cap resolution and upscaled to the\n"
+    "\t                      framebuffer. Minimum 640x480. Default 1280x720.\n"
+    "\t--scale_mode=N        Upscaling algorithm used when render_cap is smaller\n"
+    "\t                      than the framebuffer. 0=nearest (fastest),\n"
+    "\t                      1=bilinear (default), 2=bicubic (sharpest).\n"
     "\t--meta_dir=xx         Metadata relative root directory to store metadata file.\n"
     "\t                      Should only be set if the common directory of documents is changed.\n"
     "\t                      Default \"docs/\".'\n"
@@ -644,6 +680,8 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
     STATUS_FILE,
     PRINT_FB_DEBUG_INFO_AND_EXIT,
     META_DIR,
+    RENDER_CAP,
+    SCALE_MODE,
   };
   // Command line options.
   static const option LongFlags[] = {
@@ -662,6 +700,8 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
       {"fb_debug_info", false, nullptr, PRINT_FB_DEBUG_INFO_AND_EXIT},
       {"store_size", true, nullptr, STORE_SIZE},
       {"guard_time", true,  nullptr, GUARD_TIME},
+      {"render_cap", true, nullptr, RENDER_CAP},
+      {"scale_mode", true, nullptr, SCALE_MODE},
       {0, 0, 0, 0},
   };
   static const char* ShortFlags = "hP:p:z:r:c:f:";
@@ -717,6 +757,39 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
         }
         state->inputState.EdgeGuardTime = std::max(0, state->inputState.EdgeGuardTime);
         break;
+      case RENDER_CAP: {
+        int w = 0, h = 0;
+        if (sscanf(optarg, "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0) {
+          fprintf(
+              stderr,
+              "Invalid render cap \"%s\". Expected format: WxH, e.g. 1280x720.\n",
+              optarg);
+          exit(EXIT_FAILURE);
+        }
+        if (w < Viewer::MIN_RENDER_WIDTH || h < Viewer::MIN_RENDER_HEIGHT) {
+          fprintf(
+              stderr,
+              "Render cap %dx%d is below the minimum allowed size of %dx%d.\n",
+              w, h, Viewer::MIN_RENDER_WIDTH, Viewer::MIN_RENDER_HEIGHT);
+          exit(EXIT_FAILURE);
+        }
+        state->RenderCapWidth  = w;
+        state->RenderCapHeight = h;
+        break;
+      }
+      case SCALE_MODE: {
+        int mode = -1;
+        if (sscanf(optarg, "%d", &mode) != 1 || mode < 0 || mode > 2) {
+          fprintf(
+              stderr,
+              "Invalid scale mode \"%s\". Expected 0 (nearest), "
+              "1 (bilinear), or 2 (bicubic).\n",
+              optarg);
+          exit(EXIT_FAILURE);
+        }
+        state->RenderScaleMode = static_cast<PixelBuffer::ScaleMode>(mode);
+        break;
+      }
       case META_DIR:
         state->MetaRootDir = optarg;
         break;
@@ -823,6 +896,9 @@ std::unique_ptr<Registry> BuildRegistry() {
   registry->Register('`', std::move(std::make_unique<RestoreStateCommand>()));
 
   registry->Register('e', std::move(std::make_unique<ReloadCommand>()));
+
+  registry->Register('u', std::move(std::make_unique<CycleScaleModeCommand>(+1)));
+  registry->Register('U', std::move(std::make_unique<CycleScaleModeCommand>(-1)));
 
   // MiSTer additions
   registry->Register(27 /* Escape */, std::move(std::make_unique<ExitCommand>()));
@@ -1073,7 +1149,8 @@ int main(int argc, char* argv[]) {
 
   state.ViewerInst = std::make_unique<Viewer>(
       state.DocumentInst.get(), state.FramebufferInst.get(), state,
-      state.RenderCacheSize);
+      state.RenderCacheSize, state.RenderScaleMode,
+      state.RenderCapWidth, state.RenderCapHeight);
   std::unique_ptr<Registry> registry(BuildRegistry());
 
   state.OutlineViewInst = std::make_unique<OutlineView>(

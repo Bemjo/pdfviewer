@@ -53,10 +53,12 @@ class Framebuffer {
   // memory buffer, in pixels.
   PixelBuffer::Size GetOffset() const;
 
-  // Renders a region in a pixel buffer onto the framebuffer device. The region
-  // must be equal to or smaller than the screen size. If smaller, the source
-  // rect is centered on screen.
-  void Render(const PixelBuffer& src, const PixelBuffer::Rect& rect);
+  // Renders a region of src onto the framebuffer. src_rect is the region
+  // within src to read; dest_rect is the region of the framebuffer to write
+  // into. src and dest must be the same size.
+  void Render(const PixelBuffer& src,
+              const PixelBuffer::Rect& src_rect,
+              const PixelBuffer::Rect& dest_rect);
 
   // Return debugging information as a string.
   std::string GetDebugInfoString();

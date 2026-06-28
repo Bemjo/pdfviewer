@@ -55,6 +55,14 @@ class PixelBuffer {
         : X(x), Y(y), Width(width), Height(height) {}
   };
 
+  // Scaling algorithm used when the source and destination rects differ in
+  // size. SCALE_NEAREST is fastest; SCALE_BICUBIC is sharpest.
+  enum ScaleMode {
+    SCALE_NEAREST  = 0,
+    SCALE_BILINEAR = 1,
+    SCALER_COUNT = 2
+  };
+
   // Constructs a new PixelBuffer object, and allocate memory. Will take
   // ownership of allocated memory. Does NOT take ownership of format.
   PixelBuffer(const Size& size, const Format* format);
@@ -71,12 +79,14 @@ class PixelBuffer {
   // Returns a rect covering the buffer exactly.
   Rect GetRect() const;
 
-  // Copies a region in the current pixel buffer to another pixel buffer. The
-  // destination region must be at least as large in both dimensions than the
-  // source region. The source region is centered if the destination region is
-  // larger, and the unaffected areas are set to black. This is multi-threaded.
+  // Copies a region in the current pixel buffer to another pixel buffer. If
+  // the source and destination regions differ in size, the source is scaled to
+  // fill the destination using the given algorithm. When they are equal in size
+  // a fast 1:1 memcpy path is used regardless of scale_mode. The unaffected
+  // areas around a smaller source are cleared to black. This is multi-threaded.
   void Copy(
-      const Rect& src_rect, const Rect& dest_rect, PixelBuffer* dest) const;
+      const Rect& src_rect, const Rect& dest_rect, PixelBuffer* dest,
+      ScaleMode scale_mode = SCALE_BILINEAR) const;
 
   uint8_t* GetRawBuffer() const;
   int GetAllocatedStrideBytes() const;

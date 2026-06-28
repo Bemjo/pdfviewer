@@ -27,6 +27,7 @@
 #include <mutex>
 
 #include "cache.hpp"
+#include "pixel_buffer.hpp"
 
 class Document;
 class Framebuffer;
@@ -36,6 +37,14 @@ class Viewer {
  public:
   // Default number of rendered pages to keep in cache.
   enum { DEFAULT_RENDER_CACHE_SIZE = 8 };
+
+  // Default maximum render buffer dimensions. Pages are rendered at most at
+  // this size and upscaled to the framebuffer.
+  static const int DEFAULT_MAX_RENDER_WIDTH  = 1280;
+  static const int DEFAULT_MAX_RENDER_HEIGHT = 720;
+  // Minimum allowed render cap dimensions.
+  static const int MIN_RENDER_WIDTH  = 640;
+  static const int MIN_RENDER_HEIGHT = 480;
 
   // Zoom modes.
   enum {
@@ -105,7 +114,10 @@ class Viewer {
   // the framebuffer object.
   Viewer(
       Document* doc, Framebuffer* fb, const State& state = State(),
-      int render_cache_size = DEFAULT_RENDER_CACHE_SIZE);
+      int render_cache_size = DEFAULT_RENDER_CACHE_SIZE,
+      PixelBuffer::ScaleMode scale_mode = PixelBuffer::SCALE_BILINEAR,
+      int max_render_width  = DEFAULT_MAX_RENDER_WIDTH,
+      int max_render_height = DEFAULT_MAX_RENDER_HEIGHT);
   virtual ~Viewer();
 
   // Renders the present view to the framebuffer.
@@ -120,6 +132,12 @@ class Viewer {
 
   PerPageState GetPageState(int page = -1);
 
+  // Changes the upscaling algorithm and flushes the render cache so the next
+  // Render() call rebuilds with the new mode.
+  void SetScaleMode(PixelBuffer::ScaleMode mode);
+  // Flushes the render cache, forcing a full re-render on next Render() call.
+  void FlushCache();
+
  private:
   // The current document.
   Document* _doc;
@@ -129,6 +147,11 @@ class Viewer {
   State _state;
   // Total cache capacity.
   int _cache_size;
+  // Upscaling algorithm when the render buffer is smaller than the framebuffer.
+  PixelBuffer::ScaleMode _scale_mode;
+  // Maximum render buffer dimensions; content is upscaled to the framebuffer.
+  int _max_render_width;
+  int _max_render_height;
 
   // Per-page zoom/pan/rotation state. Protected by _page_states_mutex so
   // background Load() threads can read safely while the main thread writes.

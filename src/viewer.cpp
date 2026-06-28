@@ -33,11 +33,15 @@ const float Viewer::MIN_ZOOM = 0.1f;
 
 Viewer::Viewer(
     Document* doc, Framebuffer* fb, const Viewer::State& state,
-    int render_cache_size)
+    int render_cache_size, PixelBuffer::ScaleMode scale_mode,
+    int max_render_width, int max_render_height)
     : _doc(doc),
       _fb(fb),
       _state(state),
       _cache_size(render_cache_size),
+      _scale_mode(scale_mode),
+      _max_render_width(max_render_width),
+      _max_render_height(max_render_height),
       _last_rendered_page(-1),
       _last_preloaded_page(-1),
       _render_cache(this, render_cache_size) {
@@ -131,8 +135,12 @@ void Viewer::Render() {
   _render_cache.SetCenter(page);
   std::shared_ptr<PixelBuffer> buffer = _render_cache.Get(page, refresh);
 
-  // 6. Blit to framebuffer.
-  _fb->Render(*buffer, PixelBuffer::Rect(0, 0, vp_w, vp_h));
+  // 6. Blit to framebuffer. The buffer is already upscaled to screen_vp size.
+  //    Pass the full framebuffer rect as dest so Copy() clears the margins
+  //    in the same pass as the content — no separate clear needed.
+  _fb->Render(*buffer,
+              buffer->GetRect(),
+              PixelBuffer::Rect(0, 0, screen_size.Width, screen_size.Height));
 
   _last_rendered_page = page;
 
@@ -224,14 +232,54 @@ std::shared_ptr<PixelBuffer> Viewer::RenderCache::Load(const int& page) {
   const int max_y = std::max(0, full_ps.Height - screen.Height);
   const int src_x = std::max(0, std::min(max_x, x_raw));
   const int src_y = std::max(0, std::min(max_y, y_raw));
-  const int vp_w  = std::min(screen.Width,  full_ps.Width  - src_x);
-  const int vp_h  = std::min(screen.Height, full_ps.Height - src_y);
+  // Screen-space viewport: the portion of the framebuffer this page covers.
+  const int screen_vp_w = std::min(screen.Width,  full_ps.Width  - src_x);
+  const int screen_vp_h = std::min(screen.Height, full_ps.Height - src_y);
+  // Render-cap viewport: what MuPDF actually draws into.
+  const int render_w = std::min(screen_vp_w, _parent->_max_render_width);
+  const int render_h = std::min(screen_vp_h, _parent->_max_render_height);
 
-  std::shared_ptr<PixelBuffer> buffer(
-      _parent->_fb->NewPixelBuffer(PixelBuffer::Size(vp_w, vp_h)));
-  _parent->_doc->Render(
-      buffer->GetRawBuffer(), page, zoom, rotation, src_x, src_y, vp_w, vp_h);
-  return buffer;
+  const bool needs_upscale = (render_w < screen_vp_w || render_h < screen_vp_h);
+
+  // Allocate the full screen-sized output buffer that goes into the cache.
+  std::shared_ptr<PixelBuffer> out_buffer(
+      _parent->_fb->NewPixelBuffer(PixelBuffer::Size(screen_vp_w, screen_vp_h)));
+
+  if (needs_upscale) {
+    // Scale zoom down proportionally so MuPDF renders the entire viewport
+    // into the smaller capped buffer, not just a crop of it.
+    // Use the axis that is more constrained to avoid exceeding either cap.
+    const float scale_x = static_cast<float>(render_w) / static_cast<float>(screen_vp_w);
+    const float scale_y = static_cast<float>(render_h) / static_cast<float>(screen_vp_h);
+    const float render_scale = std::min(scale_x, scale_y);
+    const float render_zoom  = zoom * render_scale;
+
+    // Pan offsets must also scale down to match the reduced zoom.
+    const int render_src_x = static_cast<int>(src_x * render_scale);
+    const int render_src_y = static_cast<int>(src_y * render_scale);
+
+    // Recompute the actual render buffer dimensions at the reduced zoom.
+    const Document::PageSize render_ps =
+        _parent->_doc->GetPageSize(page, render_zoom, rotation);
+    const int actual_render_w = std::min(render_ps.Width  - render_src_x, render_w);
+    const int actual_render_h = std::min(render_ps.Height - render_src_y, render_h);
+
+    // Render into a temporary capped buffer, then upscale into out_buffer.
+    std::unique_ptr<PixelBuffer> tmp_buffer(
+        _parent->_fb->NewPixelBuffer(PixelBuffer::Size(actual_render_w, actual_render_h)));
+    _parent->_doc->Render(
+        tmp_buffer->GetRawBuffer(), page, render_zoom, rotation,
+        render_src_x, render_src_y, actual_render_w, actual_render_h);
+    tmp_buffer->Copy(
+        tmp_buffer->GetRect(), out_buffer->GetRect(),
+        out_buffer.get(), _parent->_scale_mode);
+  } else {
+    _parent->_doc->Render(
+        out_buffer->GetRawBuffer(), page, zoom, rotation,
+        src_x, src_y, screen_vp_w, screen_vp_h);
+  }
+
+  return out_buffer;
 }
 
 void Viewer::RenderCache::Discard(
@@ -248,4 +296,14 @@ Viewer::PerPageState Viewer::GetPageState(int page) {
   }
   page = std::min(page, _state.NumPages - 1);
   return _page_states[page];
+}
+
+void Viewer::SetScaleMode(PixelBuffer::ScaleMode mode) {
+  _scale_mode = mode;
+  FlushCache();
+}
+
+void Viewer::FlushCache() {
+  _render_cache.Flush();
+  _last_preloaded_page = -1;
 }

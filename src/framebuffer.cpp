@@ -131,8 +131,46 @@ PixelBuffer::Size Framebuffer::GetOffset() const {
 }
 
 void Framebuffer::Render(
-    const PixelBuffer& src, const PixelBuffer::Rect& rect) {
-  src.Copy(rect, _pixel_buffer->GetRect(), _pixel_buffer.get());
+    const PixelBuffer& src, const PixelBuffer::Rect& src_rect,
+    const PixelBuffer::Rect& dest_rect) {
+  const int depth = _format->GetDepth();
+  const int fb_stride = _pixel_buffer->GetAllocatedStrideBytes();
+  // fb_base: start of the visible area in the mmap'd buffer.
+  uint8_t* fb_base = _buffer +
+      (_vinfo.yoffset * (_finfo.line_length / depth) + _vinfo.xoffset) * depth;
+
+  const int margin_left   = (dest_rect.Width  - src_rect.Width)  / 2;
+  const int margin_right  =  dest_rect.Width  - margin_left - src_rect.Width;
+  const int margin_top    = (dest_rect.Height - src_rect.Height) / 2;
+  const int margin_bottom =  dest_rect.Height - margin_top - src_rect.Height;
+  const int dest_row_bytes = dest_rect.Width * depth;
+  const int src_row_bytes  = src_rect.Width  * depth;
+
+  const uint8_t* src_base = src.GetRawBuffer();
+  const int src_stride = src.GetAllocatedStrideBytes();
+
+  for (int y = 0; y < margin_top; ++y)
+    memset(fb_base + (dest_rect.Y + y) * fb_stride + dest_rect.X * depth,
+           0, dest_row_bytes);
+
+  for (int y = 0; y < src_rect.Height; ++y) {
+    uint8_t* dest_row = fb_base +
+        (dest_rect.Y + margin_top + y) * fb_stride + dest_rect.X * depth;
+    if (margin_left)
+      memset(dest_row, 0, margin_left * depth);
+    memcpy(dest_row + margin_left * depth,
+           src_base + (src_rect.Y + y) * src_stride + src_rect.X * depth,
+           src_row_bytes);
+    if (margin_right)
+      memset(dest_row + (margin_left + src_rect.Width) * depth,
+             0, margin_right * depth);
+  }
+
+  for (int y = 0; y < margin_bottom; ++y)
+    memset(fb_base +
+               (dest_rect.Y + margin_top + src_rect.Height + y) * fb_stride +
+               dest_rect.X * depth,
+           0, dest_row_bytes);
 }
 
 Framebuffer::Format::Format(const fb_var_screeninfo& vinfo) : _vinfo(vinfo) {}
