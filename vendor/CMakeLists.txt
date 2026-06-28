@@ -12,6 +12,8 @@ find_package(Freetype REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(OpenJPEG REQUIRED)
 
+set(MUPDF_C_FLAGS "${CMAKE_C_FLAGS}" CACHE STRING "Extra CFLAGS to pass to MuPDF's build")
+
 # MuPDF provides its own version of libjpeg in thirdparty. However, we are
 # linking against the system version of Imlib2, which links against the system
 # version of libjpeg. Using the bundled version of libjpeg here will cause a
@@ -29,6 +31,7 @@ add_custom_command(
       "USE_SYSTEM_OPENJPEG=yes"
       "extract=no"
       "prefix=${CMAKE_CURRENT_BINARY_DIR}/mupdf"
+      "XCFLAGS=${MUPDF_C_FLAGS}"
       libs
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/mupdf"
 )
