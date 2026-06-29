@@ -493,7 +493,7 @@ static void BilinearVertBlend4(
 
 void PixelBuffer::Copy(
     const PixelBuffer::Rect& src_rect, const PixelBuffer::Rect& dest_rect,
-    PixelBuffer* dest, PixelBuffer::ScaleMode scale_mode) const {
+    PixelBuffer* dest, PixelBuffer::ScaleMode scale_mode, uint8_t sharpen_strength) const {
   assert(_format->GetDepth() == dest->_format->GetDepth());
   assert(_size.Width  >= src_rect.X  + src_rect.Width);
   assert(_size.Height >= src_rect.Y  + src_rect.Height);
@@ -600,8 +600,7 @@ void PixelBuffer::Copy(
       break;
     }
 
-    case SCALE_BILINEAR:
-    case SCALE_BILINEAR_SHARP: {
+    case SCALE_BILINEAR: {
 #ifdef __ARM_NEON
       if (valid_sharp_depth) {
         std::vector<int>     col_ix0(dw), col_ix1(dw);
@@ -620,7 +619,9 @@ void PixelBuffer::Copy(
           col_fx8[dx] = static_cast<uint8_t>(fxf * 255.0f + 0.5f);
         }
 
-        const uint8_t sharp_strength = (valid_sharp_depth && scale_mode == SCALE_BILINEAR_SHARP) ? 64u : 0u;
+        const uint8_t sharp_strength = valid_sharp_depth && sharpen_strength > 0 ?
+            16u << static_cast<uint8_t>(std::min(std::max(1, static_cast<int>(sharpen_strength)), 3)):
+            0u;
 
         ExecuteInParallel([=, &col_ix0, &col_ix1, &col_fx8](
                               int num_threads, int i) {

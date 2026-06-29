@@ -60,7 +60,6 @@ class PixelBuffer {
   enum ScaleMode {
     SCALE_NEAREST = 0,
     SCALE_BILINEAR,
-    SCALE_BILINEAR_SHARP,
     COUNT
   };
 
@@ -87,7 +86,7 @@ class PixelBuffer {
   // areas around a smaller source are cleared to black. This is multi-threaded.
   void Copy(
       const Rect& src_rect, const Rect& dest_rect, PixelBuffer* dest,
-      ScaleMode scale_mode = SCALE_BILINEAR) const;
+      ScaleMode scale_mode = SCALE_BILINEAR, uint8_t sharpen_strength = 3) const;
 
   uint8_t* GetRawBuffer() const;
   int GetAllocatedStrideBytes() const;

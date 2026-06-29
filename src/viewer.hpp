@@ -116,6 +116,7 @@ class Viewer {
       Document* doc, Framebuffer* fb, const State& state = State(),
       int render_cache_size = DEFAULT_RENDER_CACHE_SIZE,
       PixelBuffer::ScaleMode scale_mode = PixelBuffer::SCALE_BILINEAR,
+      uint8_t sharpen_strength = 3,
       int max_render_width  = DEFAULT_MAX_RENDER_WIDTH,
       int max_render_height = DEFAULT_MAX_RENDER_HEIGHT);
   virtual ~Viewer();
@@ -134,7 +135,7 @@ class Viewer {
 
   // Changes the upscaling algorithm and flushes the render cache so the next
   // Render() call rebuilds with the new mode.
-  void SetScaleMode(PixelBuffer::ScaleMode mode);
+  void SetScaleMode(PixelBuffer::ScaleMode mode, uint8_t sharpen_strength);
   // Flushes the render cache, forcing a full re-render on next Render() call.
   void FlushCache();
 
@@ -149,6 +150,7 @@ class Viewer {
   int _cache_size;
   // Upscaling algorithm when the render buffer is smaller than the framebuffer.
   PixelBuffer::ScaleMode _scale_mode;
+  uint8_t _sharpen_strength;
   // Maximum render buffer dimensions; content is upscaled to the framebuffer.
   int _max_render_width;
   int _max_render_height;

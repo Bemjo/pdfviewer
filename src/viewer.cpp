@@ -34,12 +34,14 @@ const float Viewer::MIN_ZOOM = 0.1f;
 Viewer::Viewer(
     Document* doc, Framebuffer* fb, const Viewer::State& state,
     int render_cache_size, PixelBuffer::ScaleMode scale_mode,
+    uint8_t sharpen_strength,
     int max_render_width, int max_render_height)
     : _doc(doc),
       _fb(fb),
       _state(state),
       _cache_size(render_cache_size),
       _scale_mode(scale_mode),
+      _sharpen_strength(sharpen_strength),
       _max_render_width(max_render_width),
       _max_render_height(max_render_height),
       _last_rendered_page(-1),
@@ -272,7 +274,7 @@ std::shared_ptr<PixelBuffer> Viewer::RenderCache::Load(const int& page) {
         render_src_x, render_src_y, actual_render_w, actual_render_h);
     tmp_buffer->Copy(
         tmp_buffer->GetRect(), out_buffer->GetRect(),
-        out_buffer.get(), _parent->_scale_mode);
+        out_buffer.get(), _parent->_scale_mode, _parent->_sharpen_strength);
   } else {
     _parent->_doc->Render(
         out_buffer->GetRawBuffer(), page, zoom, rotation,
@@ -298,8 +300,9 @@ Viewer::PerPageState Viewer::GetPageState(int page) {
   return _page_states[page];
 }
 
-void Viewer::SetScaleMode(PixelBuffer::ScaleMode mode) {
+void Viewer::SetScaleMode(PixelBuffer::ScaleMode mode, uint8_t sharpen_strength) {
   _scale_mode = mode;
+  _sharpen_strength = sharpen_strength;
   FlushCache();
 }
 

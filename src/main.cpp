@@ -125,6 +125,7 @@ struct State : public Viewer::State {
   int RenderCapHeight;
   // Upscaling algorithm (0=nearest, 1=bilinear, 2=bicubic).
   PixelBuffer::ScaleMode RenderScaleMode;
+  uint8_t SharpenStrength;
 
   // Input file.
   std::string FilePath;
@@ -603,7 +604,21 @@ class CycleScaleModeCommand : public Command {
     const int n = static_cast<int>(PixelBuffer::ScaleMode::COUNT);
     const int mode = (static_cast<int>(state->RenderScaleMode) + _direction + n) % n;
     state->RenderScaleMode = static_cast<PixelBuffer::ScaleMode>(mode);
-    state->ViewerInst->SetScaleMode(state->RenderScaleMode);
+    state->ViewerInst->SetScaleMode(state->RenderScaleMode, state->SharpenStrength);
+    state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
+  }
+
+ private:
+  int _direction;
+};
+
+class CycleBilinearSharpen : public Command {
+ public:
+  explicit CycleScaleModeCommand(int direction) : _direction(direction) {}
+
+  void Execute(int repeat, State* state) override {
+    state->SharpenStrength = (state->SharpenStrength + _direction + 4) % 4;
+    state->ViewerInst->SetScaleMode(state->RenderScaleMode, state->SharpenStrength);
     state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
   }
 
@@ -682,6 +697,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
     META_DIR,
     RENDER_CAP,
     SCALE_MODE,
+    SHARPEN
   };
   // Command line options.
   static const option LongFlags[] = {
@@ -702,6 +718,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
       {"guard_time", true,  nullptr, GUARD_TIME},
       {"render_cap", true, nullptr, RENDER_CAP},
       {"scale_mode", true, nullptr, SCALE_MODE},
+      {"sharpen", true, nullptr, SHARPEN},
       {0, 0, 0, 0},
   };
   static const char* ShortFlags = "hP:p:z:r:c:f:";
@@ -759,35 +776,40 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
         break;
       case RENDER_CAP: {
         int w = 0, h = 0;
-        if (sscanf(optarg, "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0) {
+        if (sscanf(optarg, "%dx%d", &w, &h) < 2) {
           fprintf(
               stderr,
               "Invalid render cap \"%s\". Expected format: WxH, e.g. 1280x720.\n",
               optarg);
           exit(EXIT_FAILURE);
         }
-        if (w < Viewer::MIN_RENDER_WIDTH || h < Viewer::MIN_RENDER_HEIGHT) {
-          fprintf(
-              stderr,
-              "Render cap %dx%d is below the minimum allowed size of %dx%d.\n",
-              w, h, Viewer::MIN_RENDER_WIDTH, Viewer::MIN_RENDER_HEIGHT);
-          exit(EXIT_FAILURE);
-        }
-        state->RenderCapWidth  = w;
-        state->RenderCapHeight = h;
+        state->RenderCapWidth = std::max(w, Viewer::MIN_RENDER_WIDTH);
+        state->RenderCapHeight = std::max(h, Viewer::MIN_RENDER_HEIGHT);
         break;
       }
       case SCALE_MODE: {
-        int mode = -1;
-        if (sscanf(optarg, "%d", &mode) != 1 || mode < 0 || mode > 2) {
+        int mode = 0;
+        if (sscanf(optarg, "%d", &mode) < 1) {
           fprintf(
               stderr,
-              "Invalid scale mode \"%s\". Expected 0 (nearest), "
-              "1 (bilinear), or 2 (bicubic).\n",
+              "Invalid scale mode \"%s\".\n",
               optarg);
           exit(EXIT_FAILURE);
         }
+        mode = std::min(std::max(0, mode), static_cast<int>(PixelBuffer::ScaleMode::COUNT)-1);
         state->RenderScaleMode = static_cast<PixelBuffer::ScaleMode>(mode);
+        break;
+      }
+      case SHARPEN: {
+        int str = 0;
+        if (sscanf(optarg, "%d", &str) < 1) {
+          fprintf(
+              stderr,
+              "Invalid sharpen strength \"%s\".\n",
+              optarg);
+          exit(EXIT_FAILURE);
+        }
+        state->SharpenStrength = static_cast<uint8_t>(std::min(std::max(0, str), 3));
         break;
       }
       case META_DIR:
@@ -899,6 +921,8 @@ std::unique_ptr<Registry> BuildRegistry() {
 
   registry->Register('u', std::move(std::make_unique<CycleScaleModeCommand>(+1)));
   registry->Register('U', std::move(std::make_unique<CycleScaleModeCommand>(-1)));
+  registry->Register('o', std::move(std::make_unique<CycleBilinearSharpen>(+1)));
+  registry->Register('O', std::move(std::make_unique<CycleBilinearSharpen>(-1)));
 
   // MiSTer additions
   registry->Register(27 /* Escape */, std::move(std::make_unique<ExitCommand>()));
