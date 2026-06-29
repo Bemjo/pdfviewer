@@ -600,7 +600,7 @@ class CycleScaleModeCommand : public Command {
   explicit CycleScaleModeCommand(int direction) : _direction(direction) {}
 
   void Execute(int repeat, State* state) override {
-    const int n = static_cast<int>(PixelBufer::ScaleMode::SCALER_COUNT);
+    const int n = static_cast<int>(PixelBuffer::ScaleMode::COUNT);
     const int mode = (static_cast<int>(state->RenderScaleMode) + _direction + n) % n;
     state->RenderScaleMode = static_cast<PixelBuffer::ScaleMode>(mode);
     state->ViewerInst->SetScaleMode(state->RenderScaleMode);

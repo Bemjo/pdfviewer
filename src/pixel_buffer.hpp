@@ -58,9 +58,10 @@ class PixelBuffer {
   // Scaling algorithm used when the source and destination rects differ in
   // size. SCALE_NEAREST is fastest; SCALE_BICUBIC is sharpest.
   enum ScaleMode {
-    SCALE_NEAREST  = 0,
-    SCALE_BILINEAR = 1,
-    SCALER_COUNT = 2
+    SCALE_NEAREST = 0,
+    SCALE_BILINEAR,
+    SCALE_BILINEAR_SHARP,
+    COUNT
   };
 
   // Constructs a new PixelBuffer object, and allocate memory. Will take
