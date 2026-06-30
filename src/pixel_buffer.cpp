@@ -98,6 +98,14 @@ static void BilinearHorizRow3(
     const uint16_t* __restrict__ col_ix1,
     const uint8_t* __restrict__ col_fx8,
     uint8_t* __restrict__ out, int dw) {
+  // out always points at an hrow[] slot, which is now padded to a multiple
+  // of 16 bytes within a posix_memalign(16)'d buffer, so the slot's base
+  // address is 16-byte aligned. (Individual vst3_u8 writes inside the loop
+  // are at out+dx*3, which drifts off 16-byte boundaries after the first
+  // iteration since 3 doesn't divide 16 -- this hint only helps the
+  // compiler's pointer arithmetic and the very first store, not every
+  // store in the loop.)
+  out = static_cast<uint8_t*>(__builtin_assume_aligned(out, 16));
   int dx = 0;
   const uint8x8_t v255 = vdup_n_u8(255);
   for (; dx + 8 <= dw; dx += 8) {
@@ -177,6 +185,16 @@ static void BilinearVertBlendSharp3_Templated(
     const uint8_t* __restrict__ next,
     uint8_t fy8,
     uint8_t* __restrict__ dest_row, int dw) {
+  // row0/row1/prev/next are always hrow[1]/hrow[2]/hrow[0]/hrow[3] -- 16-byte
+  // aligned slots in the padded hbuf. The loop below advances i by 16 each
+  // iteration, so every vld1q_u8 in this loop is 16-byte aligned.
+  // dest_row is the caller's real output row and is NOT guaranteed aligned
+  // (depends on dest_rect.X, dest stride, and the destination buffer's own
+  // offset), so it intentionally gets no alignment hint.
+  row0 = static_cast<const uint8_t*>(__builtin_assume_aligned(row0, 16));
+  row1 = static_cast<const uint8_t*>(__builtin_assume_aligned(row1, 16));
+  prev = static_cast<const uint8_t*>(__builtin_assume_aligned(prev, 16));
+  next = static_cast<const uint8_t*>(__builtin_assume_aligned(next, 16));
 
   const uint8x8_t vfy  = vdup_n_u8(fy8);
   const uint8x8_t vfyc = vdup_n_u8(static_cast<uint8_t>(255u - fy8));
@@ -253,6 +271,12 @@ static void BilinearVertBlendSharp3(
     const uint8_t* __restrict__ next,
     uint8_t fy8, uint8_t sharp_strength,
     uint8_t* __restrict__ dest_row, int dw) {
+  // row0/row1/prev/next are always hrow[] slots (16-byte aligned, padded).
+  // dest_row is the caller's real buffer row and is not hinted.
+  row0 = static_cast<const uint8_t*>(__builtin_assume_aligned(row0, 16));
+  row1 = static_cast<const uint8_t*>(__builtin_assume_aligned(row1, 16));
+  prev = static_cast<const uint8_t*>(__builtin_assume_aligned(prev, 16));
+  next = static_cast<const uint8_t*>(__builtin_assume_aligned(next, 16));
 
   const uint8x8_t vfy  = vdup_n_u8(fy8);
   const uint8x8_t vfyc = vdup_n_u8(static_cast<uint8_t>(255u - fy8));
@@ -344,6 +368,13 @@ static void BilinearVertBlendSharp4_Templated(
     const uint8_t* __restrict__ next,
     uint8_t fy8,
     uint8_t* __restrict__ dest_row, int dw) {
+  // row0/row1/prev/next are always hrow[1]/hrow[2]/hrow[0]/hrow[3] -- 16-byte
+  // aligned slots. i advances by 16 each iteration so every vld1q_u8 here
+  // is 16-byte aligned. dest_row (real output buffer) is not hinted.
+  row0 = static_cast<const uint8_t*>(__builtin_assume_aligned(row0, 16));
+  row1 = static_cast<const uint8_t*>(__builtin_assume_aligned(row1, 16));
+  prev = static_cast<const uint8_t*>(__builtin_assume_aligned(prev, 16));
+  next = static_cast<const uint8_t*>(__builtin_assume_aligned(next, 16));
 
   const uint8x8_t vfy  = vdup_n_u8(fy8);
   const uint8x8_t vfyc = vdup_n_u8(static_cast<uint8_t>(255u - fy8));
@@ -392,6 +423,12 @@ static void BilinearVertBlendSharp4(
     const uint8_t* __restrict__ next,
     uint8_t fy8, uint8_t sharp_strength,
     uint8_t* __restrict__ dest_row, int dw) {
+  // row0/row1/prev/next are always hrow[] slots (16-byte aligned, padded).
+  // dest_row is the caller's real buffer row and is not hinted.
+  row0 = static_cast<const uint8_t*>(__builtin_assume_aligned(row0, 16));
+  row1 = static_cast<const uint8_t*>(__builtin_assume_aligned(row1, 16));
+  prev = static_cast<const uint8_t*>(__builtin_assume_aligned(prev, 16));
+  next = static_cast<const uint8_t*>(__builtin_assume_aligned(next, 16));
 
   const uint8x8_t vfy  = vdup_n_u8(fy8);
   const uint8x8_t vfyc = vdup_n_u8(static_cast<uint8_t>(255u - fy8));
@@ -465,6 +502,11 @@ static void BilinearVertBlend3(
     const uint8_t* __restrict__ row0,
     const uint8_t* __restrict__ row1,
     uint8_t fy8, uint8_t* __restrict__ dest_row, int dw) {
+  // row0/row1 are always hrow[1]/hrow[2] -- 16-byte aligned, padded slots.
+  // dest_row is the real output row and is not hinted.
+  row0 = static_cast<const uint8_t*>(__builtin_assume_aligned(row0, 16));
+  row1 = static_cast<const uint8_t*>(__builtin_assume_aligned(row1, 16));
+
   const uint8x8_t vfy  = vdup_n_u8(fy8);
   const uint8x8_t vfyc = vdup_n_u8(static_cast<uint8_t>(255u - fy8));
   const int nbytes = dw * 3;
@@ -503,6 +545,12 @@ static void BilinearHorizRow4(
     const uint16_t* __restrict__ col_ix1,
     const uint8_t* __restrict__ col_fx8,
     uint8_t* __restrict__ out, int dw) {
+  // out always points at an hrow[] slot, padded to a 16-byte multiple, so
+  // the base is 16-byte aligned. Unlike depth=3, every vst4_u8 write at
+  // out+dx*4 is ALSO 16-byte aligned each iteration, since dx advances by 8
+  // and 8*4=32 is a multiple of 16 -- so this hint benefits every store in
+  // the loop, not just the first.
+  out = static_cast<uint8_t*>(__builtin_assume_aligned(out, 16));
   int dx = 0;
   const uint8x8_t v255 = vdup_n_u8(255);
   for (; dx + 8 <= dw; dx += 8) {
@@ -564,6 +612,11 @@ static void BilinearVertBlend4(
     const uint8_t* __restrict__ row0,
     const uint8_t* __restrict__ row1,
     uint8_t fy8, uint8_t* __restrict__ dest_row, int dw) {
+  // row0/row1 are always hrow[1]/hrow[2] -- 16-byte aligned, padded slots.
+  // dest_row is the real output row and is not hinted.
+  row0 = static_cast<const uint8_t*>(__builtin_assume_aligned(row0, 16));
+  row1 = static_cast<const uint8_t*>(__builtin_assume_aligned(row1, 16));
+
   const uint8x8_t vfy  = vdup_n_u8(fy8);
   const uint8x8_t vfyc = vdup_n_u8(static_cast<uint8_t>(255u - fy8));
   const int nbytes = dw * 4;
@@ -741,8 +794,17 @@ void PixelBuffer::Copy(
                                    ? (dh - i * rows_per) : rows_per;
           const int dy0 = i * rows_per;
 
+          // Round each hrow slot up to a multiple of 16 bytes so that, given
+          // a 16-byte-aligned allocation, every one of the 4 slots starts on
+          // a 16-byte boundary. dw*depth alone is only a multiple of 16 when
+          // dw happens to be a multiple of 16 (depth=3) or 4 (depth=4); the
+          // padding guarantees alignment regardless of dw. The extra bytes
+          // per slot (0-15) are never read since BilinearHorizRow3/4 only
+          // ever write the first dw*depth bytes of each slot.
           const int row_bytes = dw * depth;
-          const size_t buf_size = row_bytes * 4;
+          const int row_bytes_aligned = (row_bytes + 15) & ~15;
+          const size_t buf_size =
+              static_cast<size_t>(row_bytes_aligned) * 4;
           void* raw_ptr = nullptr;
           posix_memalign(&raw_ptr, 16, buf_size);
 
@@ -752,10 +814,10 @@ void PixelBuffer::Copy(
           );
 
           uint8_t* hrow[4] = {
-            hbuf.data(),
-            hbuf.data() + row_bytes,
-            hbuf.data() + row_bytes * 2,
-            hbuf.data() + row_bytes * 3,
+            hbuf.get(),
+            hbuf.get() + row_bytes_aligned,
+            hbuf.get() + row_bytes_aligned * 2,
+            hbuf.get() + row_bytes_aligned * 3,
           };
           int cached_iy[4] = { -1, -1, -1, -1 };
 
