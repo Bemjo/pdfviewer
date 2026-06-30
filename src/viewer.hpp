@@ -38,13 +38,11 @@ class Viewer {
   // Default number of rendered pages to keep in cache.
   enum { DEFAULT_RENDER_CACHE_SIZE = 8 };
 
-  // Default maximum render buffer dimensions. Pages are rendered at most at
-  // this size and upscaled to the framebuffer.
+  // Default maximum render buffer width. Pages are rendered at most at this
+  // width and upscaled to the framebuffer, preserving aspect ratio.
   static const int DEFAULT_MAX_RENDER_WIDTH  = 1280;
-  static const int DEFAULT_MAX_RENDER_HEIGHT = 720;
-  // Minimum allowed render cap dimensions.
+  // Minimum allowed render cap width.
   static const int MIN_RENDER_WIDTH  = 640;
-  static const int MIN_RENDER_HEIGHT = 480;
 
   // Zoom modes.
   enum {
@@ -117,8 +115,7 @@ class Viewer {
       int render_cache_size = DEFAULT_RENDER_CACHE_SIZE,
       PixelBuffer::ScaleMode scale_mode = PixelBuffer::SCALE_BILINEAR,
       uint8_t sharpen_strength = 3,
-      int max_render_width  = DEFAULT_MAX_RENDER_WIDTH,
-      int max_render_height = DEFAULT_MAX_RENDER_HEIGHT);
+      int max_render_width  = DEFAULT_MAX_RENDER_WIDTH);
   virtual ~Viewer();
 
   // Renders the present view to the framebuffer.
@@ -151,9 +148,9 @@ class Viewer {
   // Upscaling algorithm when the render buffer is smaller than the framebuffer.
   PixelBuffer::ScaleMode _scale_mode;
   uint8_t _sharpen_strength;
-  // Maximum render buffer dimensions; content is upscaled to the framebuffer.
+  // Maximum render buffer width; content is upscaled to the framebuffer,
+  // preserving aspect ratio.
   int _max_render_width;
-  int _max_render_height;
 
   // Per-page zoom/pan/rotation state. Protected by _page_states_mutex so
   // background Load() threads can read safely while the main thread writes.
