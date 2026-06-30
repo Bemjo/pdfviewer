@@ -122,7 +122,6 @@ struct State : public Viewer::State {
   int MuPDFStoreSize;
   // Maximum render buffer size.
   int RenderCapWidth;
-  int RenderCapHeight;
   // Upscaling algorithm (0=nearest, 1=bilinear, 2=bicubic).
   PixelBuffer::ScaleMode RenderScaleMode;
   uint8_t SharpenStrength;
@@ -161,7 +160,6 @@ struct State : public Viewer::State {
         RenderCacheSize(Viewer::DEFAULT_RENDER_CACHE_SIZE),
         MuPDFStoreSize(FitzDocument::DEFAULT_STORE_SIZE),
         RenderCapWidth(Viewer::DEFAULT_MAX_RENDER_WIDTH),
-        RenderCapHeight(Viewer::DEFAULT_MAX_RENDER_HEIGHT),
         RenderScaleMode(PixelBuffer::SCALE_BILINEAR),
         FilePath(""),
         FilePassword(),
@@ -588,7 +586,7 @@ class ReloadCommand : public StateCommand {
       state->ViewerInst = std::make_unique<Viewer>(
           state->DocumentInst.get(), state->FramebufferInst.get(), *state,
           state->RenderCacheSize, state->RenderScaleMode,
-          state->RenderCapWidth, state->RenderCapHeight);
+          state->RenderCapWidth);
       state->inputState.CurrEdgeState.store(InputState::EDGE_IDLE, std::memory_order_relaxed);
     } else {
       state->Exit = true;
@@ -666,10 +664,10 @@ static const char* HELP_STRING =
     "\t--guard_time=N        Time in milliseconds where input must be released\n"
     "\t                      to trigger a page change when moving up or down.\n"
     "\t                      Set to 0 to disable. Default 100.\n"
-    "\t--render_cap=WxH      Cap the MuPDF render buffer to WxH pixels, e.g.\n"
-    "\t                      1280x720 or 960x480. Frames larger than this are\n"
+    "\t--render_cap=W        Cap the MuPDF render buffer to W pixels, e.g.\n"
+    "\t                      1280 or 1600. Frames larger than this are\n"
     "\t                      rendered at the cap resolution and upscaled to the\n"
-    "\t                      framebuffer. Minimum 640x480. Default 1280x720.\n"
+    "\t                      framebuffer. Minimum 640. Default 1280.\n"
     "\t--scale_mode=N        Upscaling algorithm used when render_cap is smaller\n"
     "\t                      than the framebuffer. 0=nearest (fastest),\n"
     "\t                      1=bilinear (default), 2=bicubic (sharpest).\n"
@@ -775,16 +773,13 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
         state->inputState.EdgeGuardTime = std::max(0, state->inputState.EdgeGuardTime);
         break;
       case RENDER_CAP: {
-        int w = 0, h = 0;
-        if (sscanf(optarg, "%dx%d", &w, &h) < 2) {
-          fprintf(
-              stderr,
-              "Invalid render cap \"%s\". Expected format: WxH, e.g. 1280x720.\n",
-              optarg);
+        if (sscanf(optarg, "%d", &(state->RenderCapWidth)) < 1) {
+          fprintf(stderr, "Invalid render cap \"%s\"\n", optarg);
           exit(EXIT_FAILURE);
         }
-        state->RenderCapWidth = std::max(w, Viewer::MIN_RENDER_WIDTH);
-        state->RenderCapHeight = std::max(h, Viewer::MIN_RENDER_HEIGHT);
+        state->RenderCapWidth = std::min(
+          std::max(state->RenderCapWidth, static_cast<int>(Viewer::MIN_RENDER_WIDTH)),
+          static_cast<int>(Viewer::MAX_RENDER_WIDTH));
         break;
       }
       case SCALE_MODE: {
@@ -803,13 +798,10 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
       case SHARPEN: {
         int str = 0;
         if (sscanf(optarg, "%d", &str) < 1) {
-          fprintf(
-              stderr,
-              "Invalid sharpen strength \"%s\".\n",
-              optarg);
+          fprintf(stderr, "Invalid sharpen strength \"%s\".\n", optarg);
           exit(EXIT_FAILURE);
         }
-        state->SharpenStrength = static_cast<uint8_t>(std::min(std::max(0, str), 3));
+        state->SharpenStrength = static_cast<uint8_t>(std::min(std::max(0, str), 4));
         break;
       }
       case META_DIR:
@@ -1173,8 +1165,7 @@ int main(int argc, char* argv[]) {
 
   state.ViewerInst = std::make_unique<Viewer>(
       state.DocumentInst.get(), state.FramebufferInst.get(), state,
-      state.RenderCacheSize, state.RenderScaleMode,
-      state.RenderCapWidth, state.RenderCapHeight);
+      state.RenderCacheSize, state.RenderScaleMode, state.RenderCapWidth);
   std::unique_ptr<Registry> registry(BuildRegistry());
 
   state.OutlineViewInst = std::make_unique<OutlineView>(

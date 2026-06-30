@@ -38,11 +38,14 @@ class Viewer {
   // Default number of rendered pages to keep in cache.
   enum { DEFAULT_RENDER_CACHE_SIZE = 8 };
 
-  // Default maximum render buffer width. Pages are rendered at most at this
-  // width and upscaled to the framebuffer, preserving aspect ratio.
-  static const int DEFAULT_MAX_RENDER_WIDTH  = 1280;
   // Minimum allowed render cap width.
-  static const int MIN_RENDER_WIDTH  = 640;
+  enum {
+    MIN_RENDER_WIDTH = 640,
+    MAX_RENDER_WIDTH = 1920,
+    DEFAULT_MAX_RENDER_WIDTH = 1280,
+  };
+
+  enum { DEFAULT_RENDER_STRENGTH = 4 };
 
   // Zoom modes.
   enum {
@@ -114,7 +117,7 @@ class Viewer {
       Document* doc, Framebuffer* fb, const State& state = State(),
       int render_cache_size = DEFAULT_RENDER_CACHE_SIZE,
       PixelBuffer::ScaleMode scale_mode = PixelBuffer::SCALE_BILINEAR,
-      uint8_t sharpen_strength = 3,
+      uint8_t sharpen_strength = DEFAULT_RENDER_STRENGTH,
       int max_render_width  = DEFAULT_MAX_RENDER_WIDTH);
   virtual ~Viewer();
 

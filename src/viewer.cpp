@@ -34,8 +34,7 @@ const float Viewer::MIN_ZOOM = 0.1f;
 Viewer::Viewer(
     Document* doc, Framebuffer* fb, const Viewer::State& state,
     int render_cache_size, PixelBuffer::ScaleMode scale_mode,
-    uint8_t sharpen_strength,
-    int max_render_width)
+    uint8_t sharpen_strength, int max_render_width)
     : _doc(doc),
       _fb(fb),
       _state(state),
@@ -236,42 +235,51 @@ std::shared_ptr<PixelBuffer> Viewer::RenderCache::Load(const int& page) {
   // Screen-space viewport: the portion of the framebuffer this page covers.
   const int screen_vp_w = std::min(screen.Width,  full_ps.Width  - src_x);
   const int screen_vp_h = std::min(screen.Height, full_ps.Height - src_y);
-  // Render-cap viewport: what MuPDF actually draws into. Width is the only
-  // capped axis; height follows proportionally so page aspect ratio is
-  // always preserved.
-  const int render_w = std::min(screen_vp_w, _parent->_max_render_width);
 
-  const bool needs_upscale = (render_w < screen_vp_w);
+  // Render-cap scale factor: derived from the FRAMEBUFFER's own dimensions,
+  // not the viewport's. If the framebuffer is wider than _max_render_width,
+  // we render at the resolution the framebuffer would have if its width
+  // were _max_render_width and its height followed the framebuffer's own
+  // aspect ratio (e.g. 1920x1080 @ cap=1280 -> render at 1280x720, still
+  // 16:9). This fixed ratio is then applied uniformly to whatever portion
+  // of the page is actually visible, so zoom/pan stay locked to the same
+  // page location and content never stretches -- it only shrinks uniformly
+  // before the upscale. Using the viewport's own size here (as opposed to
+  // the framebuffer's) was the bug: a narrow viewport (e.g. a portrait page
+  // on a landscape screen) could stay under the cap even though the
+  // framebuffer itself exceeds it, silently disabling the cap.
+  const bool needs_upscale = (screen.Width > _parent->_max_render_width) &&
+      (_parent->_scale_mode != PixelBuffer::ScaleMode::SCALE_NONE);
+  const double render_scale = needs_upscale
+      ? static_cast<double>(_parent->_max_render_width) / static_cast<double>(screen.Width)
+      : 1.0;
 
   // Allocate the full screen-sized output buffer that goes into the cache.
   std::shared_ptr<PixelBuffer> out_buffer(
       _parent->_fb->NewPixelBuffer(PixelBuffer::Size(screen_vp_w, screen_vp_h)));
 
   if (needs_upscale) {
-    // Single proportional scale factor (width-derived) applied to both axes,
-    // so MuPDF renders the entire viewport into the smaller capped buffer
-    // at the correct aspect ratio, not a distorted crop of it.
-    const float render_scale =
-        static_cast<float>(render_w) / static_cast<float>(screen_vp_w);
-    const float render_zoom = zoom * render_scale;
+    const double render_zoom = zoom * render_scale;
 
     // Pan offsets scale down to match the reduced zoom.
     const int render_src_x = static_cast<int>(src_x * render_scale);
     const int render_src_y = static_cast<int>(src_y * render_scale);
 
-    // Render buffer dimensions follow the same proportional scale as the
-    // screen-space viewport. Not re-clamped against the page size at
-    // render_zoom — doing so previously shrank the crop near page edges
-    // and caused panning to stretch/compress content instead of scrolling.
-    const int render_h = static_cast<int>(screen_vp_h * render_scale);
-    const int actual_render_w = render_w;
-    const int actual_render_h = render_h;
+    // Render buffer dimensions follow the same framebuffer-derived scale
+    // factor as the zoom, so the crop's own aspect ratio (which may differ
+    // from the framebuffer's, e.g. a partial/portrait viewport) is
+    // preserved -- only the overall resolution shrinks uniformly. Not
+    // re-clamped against the page size at render_zoom -- doing so
+    // previously shrank the crop near page edges and caused panning to
+    // stretch/compress content instead of scrolling.
+    const int actual_render_w = std::max(1, static_cast<int>(screen_vp_w * render_scale));
+    const int actual_render_h = std::max(1, static_cast<int>(screen_vp_h * render_scale));
 
     // Render into a temporary capped buffer, then upscale into out_buffer.
     std::unique_ptr<PixelBuffer> tmp_buffer(
         _parent->_fb->NewPixelBuffer(PixelBuffer::Size(actual_render_w, actual_render_h)));
     _parent->_doc->Render(
-        tmp_buffer->GetRawBuffer(), page, render_zoom, rotation,
+        tmp_buffer->GetRawBuffer(), page, static_cast<float>(render_zoom), rotation,
         render_src_x, render_src_y, actual_render_w, actual_render_h);
     tmp_buffer->Copy(
         tmp_buffer->GetRect(), out_buffer->GetRect(),
