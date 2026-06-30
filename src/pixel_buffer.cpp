@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -40,7 +41,9 @@ PixelBuffer::PixelBuffer(
       _format(format),
       _has_ownership(true) {
   assert(_format != nullptr);
-  _buffer = new uint8_t[GetBufferByteSize()];
+  void* raw_ptr = nullptr;
+  posix_memalign(&raw_ptr, 16, GetBufferByteSize());
+  _buffer = static_cast<uint8_t*>(raw_ptr);
 }
 
 PixelBuffer::PixelBuffer(
@@ -61,7 +64,7 @@ PixelBuffer::PixelBuffer(
 
 PixelBuffer::~PixelBuffer() {
   if (_has_ownership) {
-    delete[] _buffer;
+    free(_buffer);
   }
 }
 
@@ -739,7 +742,15 @@ void PixelBuffer::Copy(
           const int dy0 = i * rows_per;
 
           const int row_bytes = dw * depth;
-          std::vector<uint8_t> hbuf(row_bytes * 4);
+          const size_t buf_size = row_bytes * 4;
+          void* raw_ptr = nullptr;
+          posix_memalign(&raw_ptr, 16, buf_size);
+
+          std::unique_ptr<uint8_t, void(*)(void*)> hbuf(
+              static_cast<uint8_t*>(raw_ptr),
+              std::free
+          );
+
           uint8_t* hrow[4] = {
             hbuf.data(),
             hbuf.data() + row_bytes,
