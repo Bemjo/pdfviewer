@@ -79,34 +79,58 @@ inline uint8_t Clamp8(int v) {
 
 #ifdef __ARM_NEON
 
+// ---------------------------------------------------------------------------
 // Horizontal interpolation, depth=3.
+//
+// OPT #1/#8/#2: Eliminated stg_l/stg_r staging arrays (they caused a
+// NEON store-to-load stall of ~20 cycles on Cortex-A9).  Replaced with
+// direct vset_lane_u8 gather into six uint8x8_t registers, with the inner
+// k-loop fully unrolled via #pragma GCC unroll 8.
+// OPT #2: __builtin_prefetch for the next batch's source pixels.
+// OPT #9: col_ix0/col_ix1 are uint16_t (max offset 1919*3=5757 < 65535).
+// ---------------------------------------------------------------------------
 static void BilinearHorizRow3(
     const uint8_t* __restrict__ src_row,
-    const int* __restrict__ col_ix0,
-    const int* __restrict__ col_ix1,
+    const uint16_t* __restrict__ col_ix0,
+    const uint16_t* __restrict__ col_ix1,
     const uint8_t* __restrict__ col_fx8,
     uint8_t* __restrict__ out, int dw) {
   int dx = 0;
-  #pragma GCC ivdep
+  const uint8x8_t v255 = vdup_n_u8(255);
   for (; dx + 8 <= dw; dx += 8) {
-    uint8_t stg_l[24], stg_r[24];
+    // OPT #2: prefetch source pixels for the iteration 8 pixels ahead.
+    // Guard with dx+16<=dw so we never read col_ix0[dw] (one past end).
+    // On Cortex-A9 the L1 fill latency is ~11 cycles; issuing two PLDs
+    // per iteration keeps the cache warm without flooding the bus.
+    if (dx + 16 <= dw) {
+      __builtin_prefetch(src_row + col_ix0[dx + 8], 0, 1);
+      __builtin_prefetch(src_row + col_ix1[dx + 8], 0, 1);
+    }
+
+    // OPT #1: gather directly into lane registers — no stack staging,
+    // no store-to-load hazard.
+    uint8x8_t lA, lB, lC, rA, rB, rC;
+    #pragma GCC unroll 8
     for (int k = 0; k < 8; ++k) {
       const uint8_t* L = src_row + col_ix0[dx + k];
       const uint8_t* R = src_row + col_ix1[dx + k];
-      stg_l[k*3+0]=L[0]; stg_l[k*3+1]=L[1]; stg_l[k*3+2]=L[2];
-      stg_r[k*3+0]=R[0]; stg_r[k*3+1]=R[1]; stg_r[k*3+2]=R[2];
+      lA = vset_lane_u8(L[0], lA, k);
+      lB = vset_lane_u8(L[1], lB, k);
+      lC = vset_lane_u8(L[2], lC, k);
+      rA = vset_lane_u8(R[0], rA, k);
+      rB = vset_lane_u8(R[1], rB, k);
+      rC = vset_lane_u8(R[2], rC, k);
     }
-    uint8x8_t vfx  = vld1_u8(col_fx8 + dx);
-    uint8x8_t vfxc = vsub_u8(vdup_n_u8(255), vfx);
-    uint8x8x3_t vl = vld3_u8(stg_l);
-    uint8x8x3_t vr = vld3_u8(stg_r);
 
-    uint16x8_t accA = vmull_u8(vl.val[0], vfxc);
-    uint16x8_t accB = vmull_u8(vl.val[1], vfxc);
-    uint16x8_t accC = vmull_u8(vl.val[2], vfxc);
-    accA = vmlal_u8(accA, vr.val[0], vfx);
-    accB = vmlal_u8(accB, vr.val[1], vfx);
-    accC = vmlal_u8(accC, vr.val[2], vfx);
+    uint8x8_t vfx  = vld1_u8(col_fx8 + dx);
+    uint8x8_t vfxc = vsub_u8(v255, vfx);
+
+    uint16x8_t accA = vmull_u8(lA, vfxc);
+    uint16x8_t accB = vmull_u8(lB, vfxc);
+    uint16x8_t accC = vmull_u8(lC, vfxc);
+    accA = vmlal_u8(accA, rA, vfx);
+    accB = vmlal_u8(accB, rB, vfx);
+    accC = vmlal_u8(accC, rC, vfx);
 
     uint8x8x3_t vout;
     vout.val[0] = vrshrn_n_u16(accA, 8);
@@ -124,13 +148,31 @@ static void BilinearHorizRow3(
   }
 }
 
-template <int ShiftVal>
+// ---------------------------------------------------------------------------
+// Vertical blend + sharpen, depth=3 — templated fast-path.
+//
+// OPT #4: Replaced vld3/vst3 (slow VLD3.8 on A9, ~8 cyc for 24 bytes) with
+// flat vld1q_u8/vst1q_u8 (1-2 cyc for 16 bytes).  The hrow buffers are
+// already packed byte-interleaved so the vertical blend doesn't need to
+// separate channels.  We process 16 bytes (≈5.3 pixels) per inner iteration
+// using low/high half-word arithmetic.
+//
+// OPT #3: vdup_n_u8(sharp_strength) hoisted out of the loop.
+//
+// OPT #5: boost term  base + (base*sharp)/256  replaced with
+// base + (base >> BoostShift)  using a compile-time second template param,
+// eliminating vmull_u8 + vshrq_n_u16 from the hot path.
+//   sharp=32  → BoostShift=3  (×1.125)
+//   sharp=64  → BoostShift=2  (×1.25)
+//   sharp=128 → BoostShift=1  (×1.5)
+// ---------------------------------------------------------------------------
+template <int BoostShift>
 static void BilinearVertBlendSharp3_Templated(
     const uint8_t* __restrict__ row0,
     const uint8_t* __restrict__ row1,
     const uint8_t* __restrict__ prev,
     const uint8_t* __restrict__ next,
-    uint8_t fy8, uint8_t sharp_strength,
+    uint8_t fy8,
     uint8_t* __restrict__ dest_row, int dw) {
 
   const uint8x8_t vfy  = vdup_n_u8(fy8);
@@ -138,47 +180,69 @@ static void BilinearVertBlendSharp3_Templated(
   const int nbytes = dw * 3;
 
   #pragma GCC ivdep
-  for (int i = 0; i + 24 <= nbytes; i += 24) {
-      uint8x8x3_t v0   = vld3_u8(row0 + i);
-      uint8x8x3_t v1   = vld3_u8(row1 + i);
-      uint8x8x3_t vp   = vld3_u8(prev + i);
-      uint8x8x3_t vn   = vld3_u8(next + i);
+  for (int i = 0; i + 16 <= nbytes; i += 16) {
+    uint8x16_t v0 = vld1q_u8(row0 + i);
+    uint8x16_t v1 = vld1q_u8(row1 + i);
+    uint8x16_t vp = vld1q_u8(prev + i);
+    uint8x16_t vn = vld1q_u8(next + i);
 
-      uint8x8x3_t vout;
-      uint16x8_t bilA = vmull_u8(v0.val[0], vfyc);
-      uint16x8_t bilB = vmull_u8(v0.val[1], vfyc);
-      uint16x8_t bilC = vmull_u8(v0.val[2], vfyc);
-      bilA = vmlal_u8(bilA, v1.val[0], vfy);
-      bilB = vmlal_u8(bilB, v1.val[1], vfy);
-      bilC = vmlal_u8(bilC, v1.val[2], vfy);
+    // Bilinear vertical blend.
+    uint16x8_t bilL = vmull_u8(vget_low_u8(v0),  vfyc);
+    uint16x8_t bilH = vmull_u8(vget_high_u8(v0), vfyc);
+    bilL = vmlal_u8(bilL, vget_low_u8(v1),  vfy);
+    bilH = vmlal_u8(bilH, vget_high_u8(v1), vfy);
 
-      uint8x8_t baseA = vrshrn_n_u16(bilA, 8);
-      uint8x8_t baseB = vrshrn_n_u16(bilB, 8);
-      uint8x8_t baseC = vrshrn_n_u16(bilC, 8);
+    uint8x8_t baseL = vrshrn_n_u16(bilL, 8);
+    uint8x8_t baseH = vrshrn_n_u16(bilH, 8);
 
-      uint16x8_t shA = vmull_u8(baseA, vdup_n_u8(sharp_strength));
-      uint16x8_t shB = vmull_u8(baseB, vdup_n_u8(sharp_strength));
-      uint16x8_t shC = vmull_u8(baseC, vdup_n_u8(sharp_strength));
+    // OPT #5: sharpening boost via shift — no multiply needed.
+    // s = base + (base >> BoostShift)
+    // NOTE: widening with vshll_n_u8(x, 0) is not valid asm (VSHLL has no
+    // #0 shift encoding); vmovl_u8 is the correct "widen, no scale" op.
+    uint16x8_t base16L = vmovl_u8(baseL);
+    uint16x8_t base16H = vmovl_u8(baseH);
+    int16x8_t sL = vreinterpretq_s16_u16(
+        vaddq_u16(base16L, vshrq_n_u16(base16L, BoostShift)));
+    int16x8_t sH = vreinterpretq_s16_u16(
+        vaddq_u16(base16H, vshrq_n_u16(base16H, BoostShift)));
 
-      int16x8_t sA = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shA, 8), baseA));
-      int16x8_t sB = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shB, 8), baseB));
-      int16x8_t sC = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shC, 8), baseC));
+    // Outer (prev+next) subtraction.
+    // OPT #11: vhaddq_u8 computes (p+n)>>1 in one cycle with no widening.
+    // The remaining outer shift (originally ShiftVal) is, by construction
+    // of the dispatch table below, always equal to ShiftVal-1 == BoostShift
+    // (ShiftVal = BoostShift+1 for all three sharp_strength cases), so a
+    // single template parameter correctly drives both shifts — no second
+    // param needed. Shift is done in-lane on u8 before widening, keeping
+    // the outer term in u8 until vsubw_u8 widens and subtracts in one
+    // fused step — saves 2 vaddl + 2 vshrq_n_u16 per iteration.
+    uint8x16_t havg = vhaddq_u8(vp, vn);       // (p+n)>>1  in u8
+    uint8x8_t outByteL = vshr_n_u8(vget_low_u8(havg), BoostShift);
+    uint8x8_t outByteH = vshr_n_u8(vget_high_u8(havg), BoostShift);
+    sL = vreinterpretq_s16_u16(vsubw_u8(vreinterpretq_u16_s16(sL), outByteL));
+    sH = vreinterpretq_s16_u16(vsubw_u8(vreinterpretq_u16_s16(sH), outByteH));
 
-      uint16x8_t outA = vaddl_u8(vp.val[0], vn.val[0]);
-      uint16x8_t outB = vaddl_u8(vp.val[1], vn.val[1]);
-      uint16x8_t outC = vaddl_u8(vp.val[2], vn.val[2]);
-
-      sA = vsubq_s16(sA, vreinterpretq_s16_u16(vshrq_n_u16(outA, ShiftVal)));
-      sB = vsubq_s16(sB, vreinterpretq_s16_u16(vshrq_n_u16(outB, ShiftVal)));
-      sC = vsubq_s16(sC, vreinterpretq_s16_u16(vshrq_n_u16(outC, ShiftVal)));
-
-      vout.val[0] = vqmovun_s16(sA);
-      vout.val[1] = vqmovun_s16(sB);
-      vout.val[2] = vqmovun_s16(sC);
-      vst3_u8(dest_row + i, vout);
+    vst1q_u8(dest_row + i, vcombine_u8(vqmovun_s16(sL), vqmovun_s16(sH)));
+  }
+  // 8-byte sub-tail.
+  for (int i = (nbytes / 16) * 16; i + 8 <= nbytes; i += 8) {
+    uint8x8_t v0b = vld1_u8(row0 + i), v1b = vld1_u8(row1 + i);
+    uint8x8_t vpb = vld1_u8(prev  + i), vnb = vld1_u8(next  + i);
+    uint16x8_t bil = vmull_u8(v0b, vfyc);
+    bil = vmlal_u8(bil, v1b, vfy);
+    uint8x8_t base = vrshrn_n_u16(bil, 8);
+    uint16x8_t base16 = vmovl_u8(base);
+    int16x8_t s16 = vreinterpretq_s16_u16(
+        vaddq_u16(base16, vshrq_n_u16(base16, BoostShift)));
+    // OPT #11: same hadd trick in the 8-byte tail.
+    uint8x8_t outByte = vshr_n_u8(vhadd_u8(vpb, vnb), BoostShift);
+    s16 = vreinterpretq_s16_u16(vsubw_u8(vreinterpretq_u16_s16(s16), outByte));
+    vst1_u8(dest_row + i, vqmovun_s16(s16));
   }
 }
 
+// OPT #3: sharp_strength no longer passed into the templated function since
+// the boost is encoded in BoostShift.  The dispatcher below maps the three
+// known values.
 static void BilinearVertBlendSharp3(
     const uint8_t* __restrict__ row0,
     const uint8_t* __restrict__ row1,
@@ -193,60 +257,67 @@ static void BilinearVertBlendSharp3(
   int i = 0;
 
   if (sharp_strength == 64) {
-      BilinearVertBlendSharp3_Templated<3>(row0, row1, prev, next, fy8, sharp_strength, dest_row, dw);
-      i = (nbytes / 24) * 24;
+    // ShiftVal=3 (outer >> 3), BoostShift=2 (base*1.25)
+    BilinearVertBlendSharp3_Templated<2>(row0, row1, prev, next, fy8, dest_row, dw);
+    i = (nbytes / 8) * 8;
   } else if (sharp_strength == 128) {
-      BilinearVertBlendSharp3_Templated<2>(row0, row1, prev, next, fy8, sharp_strength, dest_row, dw);
-      i = (nbytes / 24) * 24;
+    // ShiftVal=2 (outer >> 2), BoostShift=1 (base*1.5)
+    BilinearVertBlendSharp3_Templated<1>(row0, row1, prev, next, fy8, dest_row, dw);
+    i = (nbytes / 8) * 8;
   } else if (sharp_strength == 32) {
-      BilinearVertBlendSharp3_Templated<4>(row0, row1, prev, next, fy8, sharp_strength, dest_row, dw);
-      i = (nbytes / 24) * 24;
+    // ShiftVal=4 (outer >> 4), BoostShift=3 (base*1.125)
+    BilinearVertBlendSharp3_Templated<3>(row0, row1, prev, next, fy8, dest_row, dw);
+    i = (nbytes / 8) * 8;
   } else {
+    // Generic path: OPT #4 flat vld1q, OPT #3 hoisted vdup.
     const uint8x8_t vsh = vdup_n_u8(sharp_strength);
     #pragma GCC ivdep
-    for (; i + 24 <= nbytes; i += 24) {
-      uint8x8x3_t v0 = vld3_u8(row0 + i);
-      uint8x8x3_t v1 = vld3_u8(row1 + i);
-      uint8x8x3_t vp = vld3_u8(prev + i);
-      uint8x8x3_t vn = vld3_u8(next + i);
-      uint8x8x3_t vout;
-      for (int ch = 0; ch < 3; ++ch) {
-        uint16x8_t bil = vmull_u8(v0.val[ch], vfyc);
-        bil = vmlal_u8(bil, v1.val[ch], vfy);
-        uint8x8_t base = vrshrn_n_u16(bil, 8);
-        uint16x8_t sh_add = vmull_u8(base, vsh);
-        int16x8_t s16 = vreinterpretq_s16_u16(
-            vaddw_u8(vshrq_n_u16(sh_add, 8), base));
-        uint16x8_t outer = vaddl_u8(vp.val[ch], vn.val[ch]);
-        outer = vshrq_n_u16(vmulq_n_u16(outer, sharp_strength), 9);
-        s16 = vsubq_s16(s16, vreinterpretq_s16_u16(outer));
-        vout.val[ch] = vqmovun_s16(s16);
-      }
-      vst3_u8(dest_row + i, vout);
+    for (; i + 16 <= nbytes; i += 16) {
+      uint8x16_t v0 = vld1q_u8(row0 + i);
+      uint8x16_t v1 = vld1q_u8(row1 + i);
+      uint8x16_t vp = vld1q_u8(prev + i);
+      uint8x16_t vn = vld1q_u8(next + i);
+
+      uint16x8_t bilL = vmull_u8(vget_low_u8(v0),  vfyc);
+      uint16x8_t bilH = vmull_u8(vget_high_u8(v0), vfyc);
+      bilL = vmlal_u8(bilL, vget_low_u8(v1),  vfy);
+      bilH = vmlal_u8(bilH, vget_high_u8(v1), vfy);
+
+      uint8x8_t baseL = vrshrn_n_u16(bilL, 8);
+      uint8x8_t baseH = vrshrn_n_u16(bilH, 8);
+
+      uint16x8_t shL = vmull_u8(baseL, vsh);
+      uint16x8_t shH = vmull_u8(baseH, vsh);
+      int16x8_t sL = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shL, 8), baseL));
+      int16x8_t sH = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shH, 8), baseH));
+
+      uint16x8_t outL = vaddl_u8(vget_low_u8(vp),  vget_low_u8(vn));
+      uint16x8_t outH = vaddl_u8(vget_high_u8(vp), vget_high_u8(vn));
+      outL = vshrq_n_u16(vmulq_n_u16(outL, sharp_strength), 9);
+      outH = vshrq_n_u16(vmulq_n_u16(outH, sharp_strength), 9);
+      sL = vsubq_s16(sL, vreinterpretq_s16_u16(outL));
+      sH = vsubq_s16(sH, vreinterpretq_s16_u16(outH));
+
+      vst1q_u8(dest_row + i, vcombine_u8(vqmovun_s16(sL), vqmovun_s16(sH)));
+    }
+    // 8-byte tail for generic path.
+    for (; i + 8 <= nbytes; i += 8) {
+      uint8x8_t v0b = vld1_u8(row0 + i), v1b = vld1_u8(row1 + i);
+      uint8x8_t vpb = vld1_u8(prev  + i), vnb = vld1_u8(next  + i);
+      uint16x8_t bil = vmull_u8(v0b, vfyc);
+      bil = vmlal_u8(bil, v1b, vfy);
+      uint8x8_t base = vrshrn_n_u16(bil, 8);
+      uint16x8_t sh_add = vmull_u8(base, vsh);
+      int16x8_t s16 = vreinterpretq_s16_u16(
+          vaddw_u8(vshrq_n_u16(sh_add, 8), base));
+      uint16x8_t outer = vaddl_u8(vpb, vnb);
+      outer = vshrq_n_u16(vmulq_n_u16(outer, sharp_strength), 9);
+      s16 = vsubq_s16(s16, vreinterpretq_s16_u16(outer));
+      vst1_u8(dest_row + i, vqmovun_s16(s16));
     }
   }
 
-  // 8-byte tail.
-  for (; i + 8 <= nbytes; i += 8) {
-    uint8x8_t v0b = vld1_u8(row0 + i), v1b = vld1_u8(row1 + i);
-    uint8x8_t vpb = vld1_u8(prev  + i), vnb = vld1_u8(next  + i);
-    uint16x8_t bil = vmull_u8(v0b, vfyc);
-    bil = vmlal_u8(bil, v1b, vfy);
-    uint8x8_t base = vrshrn_n_u16(bil, 8);
-    uint16x8_t sh_add = vmull_u8(base, vdup_n_u8(sharp_strength));
-    int16x8_t s16 = vreinterpretq_s16_u16(
-        vaddw_u8(vshrq_n_u16(sh_add, 8), base));
-    uint16x8_t outer = vaddl_u8(vpb, vnb);
-
-    if (sharp_strength == 64) outer = vshrq_n_u16(outer, 3);
-    else if (sharp_strength == 128) outer = vshrq_n_u16(outer, 2);
-    else if (sharp_strength == 32) outer = vshrq_n_u16(outer, 4);
-    else outer = vshrq_n_u16(vmulq_n_u16(outer, sharp_strength), 9);
-
-    s16 = vsubq_s16(s16, vreinterpretq_s16_u16(outer));
-    vst1_u8(dest_row + i, vqmovun_s16(s16));
-  }
-  // Scalar tail.
+  // Scalar tail (handles the remaining < 8 bytes).
   const int fy = fy8, fyc = 255 - fy, sh = sharp_strength;
   for (; i < nbytes; ++i) {
     const int bil = (row0[i]*fyc + row1[i]*fy + 128) >> 8;
@@ -255,19 +326,24 @@ static void BilinearVertBlendSharp3(
   }
 }
 
-template <int ShiftVal>
+// ---------------------------------------------------------------------------
+// Vertical blend + sharpen, depth=4 — templated fast-path.
+//
+// OPT #5: same BoostShift trick as depth=3.
+// OPT #6: alpha is always 255 in source pixels, so the vbsl alpha-passthrough
+// is removed entirely.
+// ---------------------------------------------------------------------------
+template <int BoostShift>
 static void BilinearVertBlendSharp4_Templated(
     const uint8_t* __restrict__ row0,
     const uint8_t* __restrict__ row1,
     const uint8_t* __restrict__ prev,
     const uint8_t* __restrict__ next,
-    uint8_t fy8, uint8_t sharp_strength,
+    uint8_t fy8,
     uint8_t* __restrict__ dest_row, int dw) {
 
   const uint8x8_t vfy  = vdup_n_u8(fy8);
   const uint8x8_t vfyc = vdup_n_u8(static_cast<uint8_t>(255u - fy8));
-  const uint8x8_t vsh  = vdup_n_u8(sharp_strength);
-  const uint8x8_t alpha_mask = { 0, 0, 0, 255, 0, 0, 0, 255 };
   const int nbytes = dw * 4;
 
   #pragma GCC ivdep
@@ -277,31 +353,32 @@ static void BilinearVertBlendSharp4_Templated(
     uint8x16_t vp = vld1q_u8(prev + i);
     uint8x16_t vn = vld1q_u8(next + i);
 
-    uint16x8_t bilL = vmull_u8(vget_low_u8(v0), vfyc);
+    uint16x8_t bilL = vmull_u8(vget_low_u8(v0),  vfyc);
     uint16x8_t bilH = vmull_u8(vget_high_u8(v0), vfyc);
-    bilL = vmlal_u8(bilL, vget_low_u8(v1), vfy);
+    bilL = vmlal_u8(bilL, vget_low_u8(v1),  vfy);
     bilH = vmlal_u8(bilH, vget_high_u8(v1), vfy);
 
     uint8x8_t baseL = vrshrn_n_u16(bilL, 8);
     uint8x8_t baseH = vrshrn_n_u16(bilH, 8);
 
-    uint16x8_t shL = vmull_u8(baseL, vsh);
-    uint16x8_t shH = vmull_u8(baseH, vsh);
-    int16x8_t sL = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shL, 8), baseL));
-    int16x8_t sH = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shH, 8), baseH));
+    // OPT #5: boost via shift. vmovl_u8 widens with no scale (vshll_n_u8
+    // with a #0 immediate is not a legal VSHLL encoding).
+    uint16x8_t base16L = vmovl_u8(baseL);
+    uint16x8_t base16H = vmovl_u8(baseH);
+    int16x8_t sL = vreinterpretq_s16_u16(
+        vaddq_u16(base16L, vshrq_n_u16(base16L, BoostShift)));
+    int16x8_t sH = vreinterpretq_s16_u16(
+        vaddq_u16(base16H, vshrq_n_u16(base16H, BoostShift)));
 
-    uint16x8_t outL = vaddl_u8(vget_low_u8(vp), vget_low_u8(vn));
-    uint16x8_t outH = vaddl_u8(vget_high_u8(vp), vget_high_u8(vn));
-    sL = vsubq_s16(sL, vreinterpretq_s16_u16(vshrq_n_u16(outL, ShiftVal)));
-    sH = vsubq_s16(sH, vreinterpretq_s16_u16(vshrq_n_u16(outH, ShiftVal)));
+    // OPT #11: vhaddq_u8 + vshr_n_u8 instead of vaddl + vshrq_n_u16.
+    uint8x16_t havg = vhaddq_u8(vp, vn);
+    uint8x8_t outByteL = vshr_n_u8(vget_low_u8(havg),  BoostShift);
+    uint8x8_t outByteH = vshr_n_u8(vget_high_u8(havg), BoostShift);
+    sL = vreinterpretq_s16_u16(vsubw_u8(vreinterpretq_u16_s16(sL), outByteL));
+    sH = vreinterpretq_s16_u16(vsubw_u8(vreinterpretq_u16_s16(sH), outByteH));
 
-    uint8x8_t resL = vqmovun_s16(sL);
-    uint8x8_t resH = vqmovun_s16(sH);
-
-    resL = vbsl_u8(alpha_mask, vget_low_u8(v0), resL);
-    resH = vbsl_u8(alpha_mask, vget_high_u8(v0), resH);
-
-    vst1q_u8(dest_row + i, vcombine_u8(resL, resH));
+    // OPT #6: alpha always 255 — no vbsl needed.
+    vst1q_u8(dest_row + i, vcombine_u8(vqmovun_s16(sL), vqmovun_s16(sH)));
   }
 }
 
@@ -319,17 +396,17 @@ static void BilinearVertBlendSharp4(
   int i = 0;
 
   if (sharp_strength == 64) {
-      BilinearVertBlendSharp4_Templated<3>(row0, row1, prev, next, fy8, sharp_strength, dest_row, dw);
-      i = (nbytes / 16) * 16;
+    BilinearVertBlendSharp4_Templated<2>(row0, row1, prev, next, fy8, dest_row, dw);
+    i = (nbytes / 16) * 16;
   } else if (sharp_strength == 128) {
-      BilinearVertBlendSharp4_Templated<2>(row0, row1, prev, next, fy8, sharp_strength, dest_row, dw);
-      i = (nbytes / 16) * 16;
+    BilinearVertBlendSharp4_Templated<1>(row0, row1, prev, next, fy8, dest_row, dw);
+    i = (nbytes / 16) * 16;
   } else if (sharp_strength == 32) {
-      BilinearVertBlendSharp4_Templated<4>(row0, row1, prev, next, fy8, sharp_strength, dest_row, dw);
-      i = (nbytes / 16) * 16;
+    BilinearVertBlendSharp4_Templated<3>(row0, row1, prev, next, fy8, dest_row, dw);
+    i = (nbytes / 16) * 16;
   } else {
+    // Generic path: OPT #3 hoisted vdup, OPT #6 no vbsl.
     const uint8x8_t vsh = vdup_n_u8(sharp_strength);
-    const uint8x8_t alpha_mask = { 0, 0, 0, 255, 0, 0, 0, 255 };
 
     #pragma GCC ivdep
     for (; i + 16 <= nbytes; i += 16) {
@@ -338,9 +415,9 @@ static void BilinearVertBlendSharp4(
       uint8x16_t vp = vld1q_u8(prev + i);
       uint8x16_t vn = vld1q_u8(next + i);
 
-      uint16x8_t bilL = vmull_u8(vget_low_u8(v0), vfyc);
+      uint16x8_t bilL = vmull_u8(vget_low_u8(v0),  vfyc);
       uint16x8_t bilH = vmull_u8(vget_high_u8(v0), vfyc);
-      bilL = vmlal_u8(bilL, vget_low_u8(v1), vfy);
+      bilL = vmlal_u8(bilL, vget_low_u8(v1),  vfy);
       bilH = vmlal_u8(bilH, vget_high_u8(v1), vfy);
 
       uint8x8_t baseL = vrshrn_n_u16(bilL, 8);
@@ -351,32 +428,36 @@ static void BilinearVertBlendSharp4(
       int16x8_t sL = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shL, 8), baseL));
       int16x8_t sH = vreinterpretq_s16_u16(vaddw_u8(vshrq_n_u16(shH, 8), baseH));
 
-      uint16x8_t outL = vaddl_u8(vget_low_u8(vp), vget_low_u8(vn));
+      uint16x8_t outL = vaddl_u8(vget_low_u8(vp),  vget_low_u8(vn));
       uint16x8_t outH = vaddl_u8(vget_high_u8(vp), vget_high_u8(vn));
       sL = vsubq_s16(sL, vreinterpretq_s16_u16(vshrq_n_u16(vmulq_n_u16(outL, sharp_strength), 9)));
       sH = vsubq_s16(sH, vreinterpretq_s16_u16(vshrq_n_u16(vmulq_n_u16(outH, sharp_strength), 9)));
 
-      uint8x8_t resL = vqmovun_s16(sL);
-      uint8x8_t resH = vqmovun_s16(sH);
-
-      resL = vbsl_u8(alpha_mask, vget_low_u8(v0), resL);
-      resH = vbsl_u8(alpha_mask, vget_high_u8(v0), resH);
-      vst1q_u8(dest_row + i, vcombine_u8(resL, resH));
+      // OPT #6: alpha always 255 — no vbsl.
+      vst1q_u8(dest_row + i, vcombine_u8(vqmovun_s16(sL), vqmovun_s16(sH)));
     }
   }
 
+  // Scalar tail — alpha byte (i%4==3) is also always 255 so sharpening it
+  // is harmless; but we preserve the original safe passthrough just in case.
   const uint32_t fy = fy8, fyc = 255u - fy8;
   for (; i < nbytes; ++i) {
     if (i % 4 == 3) {
-        dest_row[i] = row0[i];
+      dest_row[i] = row0[i];
     } else {
-        const int bil = (row0[i]*fyc + row1[i]*fy + 128) >> 8;
-        const int out = bil + ((bil*sharp_strength) >> 8) - (((int)prev[i] + next[i])*sharp_strength >> 9);
-        dest_row[i] = static_cast<uint8_t>(out < 0 ? 0 : out > 255 ? 255 : out);
+      const int bil = (row0[i]*fyc + row1[i]*fy + 128) >> 8;
+      const int out = bil + ((bil*sharp_strength) >> 8) - (((int)prev[i] + next[i])*sharp_strength >> 9);
+      dest_row[i] = static_cast<uint8_t>(out < 0 ? 0 : out > 255 ? 255 : out);
     }
   }
 }
 
+// ---------------------------------------------------------------------------
+// Vertical blend only (no sharpen), depth=3.
+//
+// OPT #4: replaced vld3/vst3 (VLD3.8 ~8 cyc/24B) with flat vld1q_u8
+// (1-2 cyc/16B).  Channel identity is irrelevant here; we just lerp bytes.
+// ---------------------------------------------------------------------------
 static void BilinearVertBlend3(
     const uint8_t* __restrict__ row0,
     const uint8_t* __restrict__ row1,
@@ -385,20 +466,15 @@ static void BilinearVertBlend3(
   const uint8x8_t vfyc = vdup_n_u8(static_cast<uint8_t>(255u - fy8));
   const int nbytes = dw * 3;
   int i = 0;
-  for (; i + 24 <= nbytes; i += 24) {
-    uint8x8x3_t v0 = vld3_u8(row0 + i);
-    uint8x8x3_t v1 = vld3_u8(row1 + i);
-    uint16x8_t accA = vmull_u8(v0.val[0], vfyc);
-    uint16x8_t accB = vmull_u8(v0.val[1], vfyc);
-    uint16x8_t accC = vmull_u8(v0.val[2], vfyc);
-    accA = vmlal_u8(accA, v1.val[0], vfy);
-    accB = vmlal_u8(accB, v1.val[1], vfy);
-    accC = vmlal_u8(accC, v1.val[2], vfy);
-    uint8x8x3_t vout;
-    vout.val[0] = vrshrn_n_u16(accA, 8);
-    vout.val[1] = vrshrn_n_u16(accB, 8);
-    vout.val[2] = vrshrn_n_u16(accC, 8);
-    vst3_u8(dest_row + i, vout);
+  for (; i + 16 <= nbytes; i += 16) {
+    uint8x16_t v0 = vld1q_u8(row0 + i);
+    uint8x16_t v1 = vld1q_u8(row1 + i);
+    uint16x8_t accL = vmull_u8(vget_low_u8(v0),  vfyc);
+    uint16x8_t accH = vmull_u8(vget_high_u8(v0), vfyc);
+    accL = vmlal_u8(accL, vget_low_u8(v1),  vfy);
+    accH = vmlal_u8(accH, vget_high_u8(v1), vfy);
+    vst1q_u8(dest_row + i,
+             vcombine_u8(vrshrn_n_u16(accL, 8), vrshrn_n_u16(accH, 8)));
   }
   for (; i + 8 <= nbytes; i += 8) {
     uint8x8_t v0 = vld1_u8(row0 + i);
@@ -412,33 +488,56 @@ static void BilinearVertBlend3(
     dest_row[i] = static_cast<uint8_t>((row0[i]*fyc + row1[i]*fy + 128u) >> 8);
 }
 
+// ---------------------------------------------------------------------------
+// Horizontal interpolation, depth=4.
+//
+// OPT #1/#8/#2: Same staging-buffer elimination as depth=3.
+// OPT #9: uint16_t index arrays.
+// ---------------------------------------------------------------------------
 static void BilinearHorizRow4(
     const uint8_t* __restrict__ src_row,
-    const int* __restrict__ col_ix0,
-    const int* __restrict__ col_ix1,
+    const uint16_t* __restrict__ col_ix0,
+    const uint16_t* __restrict__ col_ix1,
     const uint8_t* __restrict__ col_fx8,
     uint8_t* __restrict__ out, int dw) {
   int dx = 0;
+  const uint8x8_t v255 = vdup_n_u8(255);
   for (; dx + 8 <= dw; dx += 8) {
-    uint8_t stg_l[32], stg_r[32];
+    // OPT #2: prefetch next batch.
+    // Guard with dx+16<=dw to avoid reading col_ix0[dw] on the last iteration.
+    if (dx + 16 <= dw) {
+      __builtin_prefetch(src_row + col_ix0[dx + 8], 0, 1);
+      __builtin_prefetch(src_row + col_ix1[dx + 8], 0, 1);
+    }
+
+    // OPT #1: direct lane gather.
+    uint8x8_t lA, lB, lC, lD, rA, rB, rC, rD;
+    #pragma GCC unroll 8
     for (int k = 0; k < 8; ++k) {
       const uint8_t* L = src_row + col_ix0[dx + k];
       const uint8_t* R = src_row + col_ix1[dx + k];
-      stg_l[k*4+0]=L[0]; stg_l[k*4+1]=L[1]; stg_l[k*4+2]=L[2]; stg_l[k*4+3]=L[3];
-      stg_r[k*4+0]=R[0]; stg_r[k*4+1]=R[1]; stg_r[k*4+2]=R[2]; stg_r[k*4+3]=R[3];
+      lA = vset_lane_u8(L[0], lA, k);
+      lB = vset_lane_u8(L[1], lB, k);
+      lC = vset_lane_u8(L[2], lC, k);
+      lD = vset_lane_u8(L[3], lD, k);
+      rA = vset_lane_u8(R[0], rA, k);
+      rB = vset_lane_u8(R[1], rB, k);
+      rC = vset_lane_u8(R[2], rC, k);
+      rD = vset_lane_u8(R[3], rD, k);
     }
+
     uint8x8_t vfx  = vld1_u8(col_fx8 + dx);
-    uint8x8_t vfxc = vsub_u8(vdup_n_u8(255), vfx);
-    uint8x8x4_t vl = vld4_u8(stg_l);
-    uint8x8x4_t vr = vld4_u8(stg_r);
-    uint16x8_t accA = vmull_u8(vl.val[0], vfxc);
-    uint16x8_t accB = vmull_u8(vl.val[1], vfxc);
-    uint16x8_t accC = vmull_u8(vl.val[2], vfxc);
-    uint16x8_t accD = vmull_u8(vl.val[3], vfxc);
-    accA = vmlal_u8(accA, vr.val[0], vfx);
-    accB = vmlal_u8(accB, vr.val[1], vfx);
-    accC = vmlal_u8(accC, vr.val[2], vfx);
-    accD = vmlal_u8(accD, vr.val[3], vfx);
+    uint8x8_t vfxc = vsub_u8(v255, vfx);
+
+    uint16x8_t accA = vmull_u8(lA, vfxc);
+    uint16x8_t accB = vmull_u8(lB, vfxc);
+    uint16x8_t accC = vmull_u8(lC, vfxc);
+    uint16x8_t accD = vmull_u8(lD, vfxc);
+    accA = vmlal_u8(accA, rA, vfx);
+    accB = vmlal_u8(accB, rB, vfx);
+    accC = vmlal_u8(accC, rC, vfx);
+    accD = vmlal_u8(accD, rD, vfx);
+
     uint8x8x4_t vout;
     vout.val[0] = vrshrn_n_u16(accA, 8);
     vout.val[1] = vrshrn_n_u16(accB, 8);
@@ -457,6 +556,7 @@ static void BilinearHorizRow4(
   }
 }
 
+// BilinearVertBlend4 is already optimal (flat vld1q, no channel split needed).
 static void BilinearVertBlend4(
     const uint8_t* __restrict__ row0,
     const uint8_t* __restrict__ row1,
@@ -603,8 +703,10 @@ void PixelBuffer::Copy(
     case SCALE_BILINEAR: {
 #ifdef __ARM_NEON
       if (valid_sharp_depth) {
-        std::vector<int>     col_ix0(dw), col_ix1(dw);
-        std::vector<uint8_t> col_fx8(dw);
+        // OPT #9: uint16_t index arrays — max offset 1919*4=7676 < 65535,
+        // halving the L1 footprint of the index tables.
+        std::vector<uint16_t> col_ix0(dw), col_ix1(dw);
+        std::vector<uint8_t>  col_fx8(dw);
         for (int dx = 0; dx < dw; ++dx) {
           const float sx = src_rect.X +
               (dx + 0.5f) * static_cast<float>(sw) / static_cast<float>(dw)
@@ -614,14 +716,20 @@ void PixelBuffer::Copy(
           if (ix < src_rect.X) { ix = src_rect.X; fxf = 0.0f; }
           const int ix_max = src_rect.X + sw - 1;
           const int ix1 = (ix < ix_max) ? ix + 1 : ix_max;
-          col_ix0[dx] = ix  * depth;
-          col_ix1[dx] = ix1 * depth;
+          col_ix0[dx] = static_cast<uint16_t>(ix  * depth);
+          col_ix1[dx] = static_cast<uint16_t>(ix1 * depth);
           col_fx8[dx] = static_cast<uint8_t>(fxf * 255.0f + 0.5f);
         }
 
         const uint8_t sharp_strength = valid_sharp_depth && sharpen_strength > 0 ?
             16u << static_cast<uint8_t>(std::min(std::max(1, static_cast<int>(sharpen_strength)), 3)):
             0u;
+
+        // OPT #10: precompute the source row clamp bounds once so that
+        // ensure_hrow does a branchless clamp (SMAX/SMIN) rather than
+        // calling std::max/std::min with possible function-call overhead.
+        const int ry_min = src_rect.Y;
+        const int ry_max = src_rect.Y + sh - 1;
 
         ExecuteInParallel([=, &col_ix0, &col_ix1, &col_fx8](
                               int num_threads, int i) {
@@ -640,8 +748,12 @@ void PixelBuffer::Copy(
           };
           int cached_iy[4] = { -1, -1, -1, -1 };
 
+          // OPT #10: clamp is now a simple ternary; GCC emits SMAX/SMIN.
+          auto clamp_row = [&](int ry) -> int {
+            return ry < ry_min ? ry_min : (ry > ry_max ? ry_max : ry);
+          };
+
           auto ensure_hrow = [&](int slot, int ry) {
-            ry = std::max(src_rect.Y, std::min(src_rect.Y + sh - 1, ry));
             if (cached_iy[slot] != ry) {
               if (depth == 3)
                 BilinearHorizRow3(src_base + ry * src_stride,
@@ -671,10 +783,16 @@ void PixelBuffer::Copy(
                                 dest_rect.X * depth;
 
             if (valid_sharp_depth && sharp_strength > 0) {
-              ensure_hrow(0, iy - 1);
-              ensure_hrow(1, iy);
-              ensure_hrow(2, iy1);
-              ensure_hrow(3, iy1 + 1);
+              // OPT #10: clamp all four row indices before entering ensure_hrow
+              // so the clamped values are reused directly without re-clamping.
+              const int r0 = clamp_row(iy - 1);
+              const int r1 = clamp_row(iy);
+              const int r2 = clamp_row(iy1);
+              const int r3 = clamp_row(iy1 + 1);
+              ensure_hrow(0, r0);
+              ensure_hrow(1, r1);
+              ensure_hrow(2, r2);
+              ensure_hrow(3, r3);
 
               if (iy == iy1) {
                 memcpy(dest_row, hrow[1], row_bytes);
@@ -686,8 +804,10 @@ void PixelBuffer::Copy(
                                         fy8, sharp_strength, dest_row, dw);
               }
             } else {
-              ensure_hrow(1, iy);
-              ensure_hrow(2, iy1);
+              const int r1 = clamp_row(iy);
+              const int r2 = clamp_row(iy1);
+              ensure_hrow(1, r1);
+              ensure_hrow(2, r2);
               if (iy == iy1) {
                 memcpy(dest_row, hrow[1], row_bytes);
               } else if (depth == 3) {

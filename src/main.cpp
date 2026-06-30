@@ -614,7 +614,7 @@ class CycleScaleModeCommand : public Command {
 
 class CycleBilinearSharpen : public Command {
  public:
-  explicit CycleScaleModeCommand(int direction) : _direction(direction) {}
+  explicit CycleBilinearSharpen(int direction) : _direction(direction) {}
 
   void Execute(int repeat, State* state) override {
     state->SharpenStrength = (state->SharpenStrength + _direction + 4) % 4;
