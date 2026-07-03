@@ -27,11 +27,53 @@
 #include <memory>
 #include <string>
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_STROKER_H
+
 #include "pixel_buffer.hpp"
 
 // An abstraction for a framebuffer device.
 class Framebuffer {
  public:
+  struct Color {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+
+    Color(uint8_t R = 0, uint8_t G = 0, uint8_t B = 0) :
+          r(R), g(G), b(B) {}
+  };
+
+  enum AnchorPosition {
+    TopLeft, Top, TopRight,
+    Left, Center, Right,
+    BottomLeft, Bottom, BottomRight
+  };
+
+  struct TextRenderParams {
+      Color Fill;
+      Color Outline;
+      int OutlineWidth;
+      int FontSize;
+      AnchorPosition Anchor;
+
+      // Explicit constructor to initialize everything
+      TextRenderParams() :
+          Fill(255, 255, 255),
+          Outline(0, 0, 0),
+          OutlineWidth(1),
+          FontSize(18),
+          Anchor(AnchorPosition::TopLeft) {}
+
+      // Builder methods for inline chaining
+      TextRenderParams& SetAnchor(AnchorPosition a) { Anchor = a; return *this; }
+      TextRenderParams& SetFontSize(int s) { FontSize = s; return *this; }
+      TextRenderParams& SetFill(const Color &c) { Fill = c; return *this; }
+      TextRenderParams& SetOutline(const Color &c) { Outline = c; return *this; }
+      TextRenderParams& SetWidth(int w) { OutlineWidth = w; return *this; }
+  };
+
   static const char* const DEFAULT_FRAMEBUFFER_DEVICE;
   // Factory method to initialize a framebuffer device and returns an
   // abstraction object. Returns nullptr if the initialization failed. Caller
@@ -39,6 +81,8 @@ class Framebuffer {
   static Framebuffer* Open(
       const std::string& device = DEFAULT_FRAMEBUFFER_DEVICE);
   virtual ~Framebuffer();
+
+  bool InitFreetype(const uint8_t* font_data, size_t font_size_bytes);
 
   // Creates a new pixel buffer with the given size. The pixel buffer will have
   // the same color settings as the screen. Caller owns returned value.
@@ -59,6 +103,9 @@ class Framebuffer {
   void Render(const PixelBuffer& src,
               const PixelBuffer::Rect& src_rect,
               const PixelBuffer::Rect& dest_rect);
+
+  void DrawText(int x, int y, const std::string& text,
+                const TextRenderParams &params = TextRenderParams());
 
   // Return debugging information as a string.
   std::string GetDebugInfoString();
@@ -92,6 +139,10 @@ class Framebuffer {
   std::unique_ptr<Format> _format;
   // Pixel buffer object managing the mmap'ed buffer.
   std::unique_ptr<PixelBuffer> _pixel_buffer;
+
+  FT_Library _ft;
+  FT_Face _face;
+  FT_Stroker _stroker;
 
   // Contructors are disallowed. Use factory method Open() instead.
   Framebuffer(const std::string& device);

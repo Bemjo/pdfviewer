@@ -67,6 +67,7 @@
 #include "search_view.hpp"
 #include "viewer.hpp"
 #include "pdfmeta.hpp"
+#include "embedded_font.hpp"
 
 struct InputState {
   enum {DEFAULT_PAGE_EDGE_TIME = 100 };
@@ -1144,6 +1145,10 @@ int main(int argc, char* argv[]) {
   }
 
   if (!LoadFile(&state)) {
+    exit(EXIT_FAILURE);
+  }
+
+  if (!state.FramebufferInst->InitFreetype(_binary_font_ttf_start, GetFontSize())) {
     exit(EXIT_FAILURE);
   }
 

@@ -62,11 +62,33 @@ error:
   return nullptr;
 }
 
+bool Framebuffer::InitFreetype(const uint8_t* font_data, size_t font_size_bytes) {
+  if (FT_Init_FreeType(&_ft)) {
+    return false;
+  }
+
+  if (FT_New_Memory_Face(_ft, font_data, font_size_bytes, 0, &_face)) {
+    FT_Done_FreeType(_ft);
+    return false;
+  }
+
+  if (FT_Stroker_New(_ft, &_stroker)) {
+    FT_Done_FreeType(_ft);
+    FT_Done_Face(_face);
+    return false;
+  }
+
+  return true;
+}
+
 Framebuffer::Framebuffer(const std::string& device)
     : _device(device),
       _buffer(nullptr),
       _format(nullptr),
-      _pixel_buffer(nullptr) {}
+      _pixel_buffer(nullptr),
+      _ft(nullptr),
+      _face(nullptr),
+      _stroker(nullptr) {}
 
 Framebuffer::~Framebuffer() {
   if (_buffer != nullptr && _buffer != MAP_FAILED) {
@@ -75,6 +97,18 @@ Framebuffer::~Framebuffer() {
   }
   if (_fd != -1) {
     close(_fd);
+  }
+
+  if (_stroker != nullptr) {
+    FT_Stroker_New(_ft, &_stroker);
+  }
+
+  if (_face != nullptr) {
+    FT_Done_Face(_face);
+  }
+
+  if (_ft != nullptr) {
+    FT_Done_FreeType(_ft);
   }
 }
 
@@ -186,4 +220,144 @@ uint32_t Framebuffer::Format::Pack(uint8_t r, uint8_t g, uint8_t b) const {
           << _vinfo.green.offset) |
          ((static_cast<uint32_t>(b) >> (8 - _vinfo.blue.length))
           << _vinfo.blue.offset);
+}
+
+void Framebuffer::DrawText(int x, int y, const std::string& text, const TextRenderParams &params) {
+  if (_ft == nullptr || _face == nullptr || _stroker == nullptr) {
+    return;
+  }
+
+  FT_Set_Pixel_Sizes(_face, 0, std::max(8, params.FontSize));
+
+  int max_width = 0;
+  int current_line_width = 0;
+  int lines = 1;
+
+  for (char c : text) {
+    if (c == '\n') {
+      lines++;
+      if (current_line_width > max_width) max_width = current_line_width;
+      current_line_width = 0;
+      continue;
+    }
+    // Load without rendering just to get the advance metrics
+    if (FT_Load_Char(_face, c, FT_LOAD_DEFAULT)) continue;
+    current_line_width += (_face->glyph->advance.x >> 6);
+  }
+  if (current_line_width > max_width) max_width = current_line_width;
+
+  int line_height = _face->size->metrics.height >> 6;
+  int total_height = lines * line_height;
+
+  // Account for the outline width so flush-right/bottom text doesn't clip
+  int padding = (params.OutlineWidth > 0) ? params.OutlineWidth : 0;
+
+  // Calculate anchored starting coordinates
+  int start_x = x;
+  int start_y = y;
+
+  // Horizontal shifts
+  if (params.Anchor == Top || params.Anchor == Center || params.Anchor == Bottom) {
+    start_x -= (max_width / 2);
+  } else if (params.Anchor == TopRight || params.Anchor == Right || params.Anchor == BottomRight) {
+    start_x -= (max_width + padding);
+  }
+
+  // Vertical shifts
+  if (params.Anchor == Left || params.Anchor == Center || params.Anchor == Right) {
+    start_y -= (total_height / 2);
+  } else if (params.Anchor == BottomLeft || params.Anchor == Bottom || params.Anchor == BottomRight) {
+    start_y -= (total_height + padding);
+  }
+
+  if (params.OutlineWidth > 0) {
+    FT_Stroker_Set(_stroker, params.OutlineWidth * 64, FT_STROKER_LINECAP_ROUND, FT_STROKER_LINEJOIN_ROUND, 0);
+  }
+
+  const int depth = _format->GetDepth();
+  const int screen_w = _vinfo.xres;
+  const int screen_h = _vinfo.yres;
+
+  uint8_t* fb_base = _buffer + (_vinfo.yoffset * (_finfo.line_length / depth) + _vinfo.xoffset) * depth;
+
+  int current_x = start_x + padding; // offset initial padding so left edge doesn't clip
+  int baseline_y = start_y + padding + (_face->size->metrics.ascender >> 6);
+
+  const uint32_t rgb_mask = (((1 << _vinfo.red.length) - 1) << _vinfo.red.offset) |
+                            (((1 << _vinfo.green.length) - 1) << _vinfo.green.offset) |
+                            (((1 << _vinfo.blue.length) - 1) << _vinfo.blue.offset);
+
+  // Updated lambda to accept the new Color struct
+  auto blend_glyph_direct = [&](FT_BitmapGlyph bitmap_glyph, const Color& color) {
+    FT_Bitmap* bitmap = &bitmap_glyph->bitmap;
+
+    for (unsigned int row = 0; row < bitmap->rows; ++row) {
+      int draw_y = baseline_y - bitmap_glyph->top + row;
+      if (draw_y < 0 || draw_y >= screen_h) continue;
+
+      for (unsigned int col = 0; col < bitmap->width; ++col) {
+        int draw_x = current_x + bitmap_glyph->left + col;
+        if (draw_x < 0 || draw_x >= screen_w) continue;
+
+        uint8_t alpha = bitmap->buffer[row * bitmap->pitch + col];
+        if (alpha == 0) continue;
+
+        uint8_t* pixel_ptr = fb_base + draw_y * _finfo.line_length + draw_x * depth;
+        uint32_t bg_pixel = 0;
+        uint8_t inv_alpha = 255 - alpha;
+        memcpy(&bg_pixel, pixel_ptr, depth);
+
+        Color bg = {
+          static_cast<uint8_t>(((bg_pixel >> _vinfo.red.offset) << (8 - _vinfo.red.length)) & 0xFF),
+          static_cast<uint8_t>(((bg_pixel >> _vinfo.green.offset) << (8 - _vinfo.green.length)) & 0xFF),
+          static_cast<uint8_t>(((bg_pixel >> _vinfo.blue.offset) << (8 - _vinfo.blue.length)) & 0xFF)
+        };
+        Color blend = {
+          static_cast<uint8_t>((color.r * alpha + bg.r * inv_alpha) / 255),
+          static_cast<uint8_t>((color.g * alpha + bg.g * inv_alpha) / 255),
+          static_cast<uint8_t>((color.b * alpha + bg.b * inv_alpha) / 255)
+        };
+
+        uint32_t packed_pixel = _format->Pack(blend.r, blend.g, blend.b);
+        if (depth == 4) {
+          packed_pixel |= (bg_pixel & ~rgb_mask);
+        }
+
+        memcpy(pixel_ptr, &packed_pixel, depth);
+      }
+    }
+  };
+
+  for (char c : text) {
+    if (c == '\n') {
+      baseline_y += (_face->size->metrics.height >> 6);
+      current_x = x;
+      continue;
+    }
+
+    if (FT_Load_Char(_face, c, FT_LOAD_NO_BITMAP)) continue;
+
+    FT_Glyph glyph;
+    if (FT_Get_Glyph(_face->glyph, &glyph)) continue;
+
+    if (params.OutlineWidth > 0) {
+      FT_Glyph stroke_glyph = glyph;
+      FT_Glyph_Stroke(&stroke_glyph, _stroker, 1);
+      FT_Glyph_To_Bitmap(&stroke_glyph, FT_RENDER_MODE_NORMAL, 0, 1);
+
+      // Pass the outline color
+      blend_glyph_direct(reinterpret_cast<FT_BitmapGlyph>(stroke_glyph), params.Outline);
+      FT_Done_Glyph(stroke_glyph);
+    }
+
+    FT_Glyph fill_glyph = glyph;
+    FT_Glyph_To_Bitmap(&fill_glyph, FT_RENDER_MODE_NORMAL, 0, 1);
+
+    // Pass the fill color
+    blend_glyph_direct(reinterpret_cast<FT_BitmapGlyph>(fill_glyph), params.Fill);
+
+    current_x += (_face->glyph->advance.x >> 6);
+    FT_Done_Glyph(fill_glyph);
+    FT_Done_Glyph(glyph);
+  }
 }

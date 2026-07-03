@@ -124,6 +124,15 @@ target_link_libraries(
   ${CURSES_LIBRARIES}
 )
 
+set(FONT_OBJ "${CMAKE_CURRENT_BINARY_DIR}/font_data.o")
+
+add_custom_command(
+    OUTPUT ${FONT_OBJ}
+    COMMAND ${CMAKE_OBJCOPY} -I binary -O elf32-littlearm -B arm font.ttf ${FONT_OBJ}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/font.ttf
+)
+
 # jfbview
 # -------
 set(
@@ -133,7 +142,7 @@ set(
   jpdfcat.cpp
   pdfmeta.cpp
 )
-add_executable(jfbview ${jfbview_sources})
+add_executable(jfbview ${jfbview_sources} ${FONT_OBJ})
 target_link_libraries(jfbview jfbview_document_viewer)
 install(TARGETS jfbview DESTINATION bin)
 add_custom_target(
