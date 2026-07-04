@@ -100,7 +100,7 @@ Framebuffer::~Framebuffer() {
   }
 
   if (_stroker != nullptr) {
-    FT_Stroker_New(_ft, &_stroker);
+    FT_Stroker_Done(_stroker);
   }
 
   if (_face != nullptr) {
@@ -342,7 +342,7 @@ void Framebuffer::DrawText(int x, int y, const std::string& text, const TextRend
 
     if (params.OutlineWidth > 0) {
       FT_Glyph stroke_glyph = glyph;
-      FT_Glyph_Stroke(&stroke_glyph, _stroker, 1);
+      FT_Glyph_Stroke(&stroke_glyph, _stroker, 0);
       FT_Glyph_To_Bitmap(&stroke_glyph, FT_RENDER_MODE_NORMAL, 0, 1);
 
       // Pass the outline color
@@ -358,6 +358,5 @@ void Framebuffer::DrawText(int x, int y, const std::string& text, const TextRend
 
     current_x += (_face->glyph->advance.x >> 6);
     FT_Done_Glyph(fill_glyph);
-    FT_Done_Glyph(glyph);
   }
 }

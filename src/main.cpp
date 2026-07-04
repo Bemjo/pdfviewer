@@ -1148,7 +1148,9 @@ int main(int argc, char* argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  if (!state.FramebufferInst->InitFreetype(_binary_font_ttf_start, GetFontSize())) {
+  std::vector<uint8_t> aligned_font(_binary_font_ttf_start, _binary_font_ttf_end);
+
+  if (!state.FramebufferInst->InitFreetype(aligned_font.data(), aligned_font.size())) {
     exit(EXIT_FAILURE);
   }
 
