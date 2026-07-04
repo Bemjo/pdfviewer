@@ -162,6 +162,7 @@ struct State : public Viewer::State {
         MuPDFStoreSize(FitzDocument::DEFAULT_STORE_SIZE),
         RenderCapWidth(Viewer::DEFAULT_MAX_RENDER_WIDTH),
         RenderScaleMode(PixelBuffer::SCALE_BILINEAR),
+        SharpenStrength(3),
         FilePath(""),
         FilePassword(),
         FramebufferDevice(Framebuffer::DEFAULT_FRAMEBUFFER_DEVICE),
@@ -802,7 +803,7 @@ static void ParseCommandLine(int argc, char* argv[], State* state) {
           fprintf(stderr, "Invalid sharpen strength \"%s\".\n", optarg);
           exit(EXIT_FAILURE);
         }
-        state->SharpenStrength = static_cast<uint8_t>(std::min(std::max(0, str), 4));
+        state->SharpenStrength = static_cast<uint8_t>(std::min(std::max(0, str), 3));
         break;
       }
       case META_DIR:

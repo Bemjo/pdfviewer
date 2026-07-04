@@ -45,10 +45,10 @@ struct ProfileTimer {
     }
 
     // Returns formatted string in milliseconds
-    std::string GetElapsedString() const {
+    long long GetElapsed() const {
         auto end_time = std::chrono::steady_clock::now();
         auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-        return "Time: " + std::to_string(diff.count()) + " ms";
+        return diff.count();
     }
 };
 
@@ -65,7 +65,8 @@ Viewer::Viewer(
       _max_render_width(max_render_width),
       _last_rendered_page(-1),
       _last_preloaded_page(-1),
-      _render_cache(this, render_cache_size) {
+      _render_cache(this, render_cache_size),
+      _total_render_time(0) {
   assert(_doc != nullptr);
   assert(_fb != nullptr);
 }
@@ -156,7 +157,11 @@ void Viewer::Render() {
   _render_cache.SetCenter(page);
   ProfileTimer timer;
   std::shared_ptr<PixelBuffer> buffer = _render_cache.Get(page, refresh);
-  const std::string cache_str = timer.GetElapsedString();
+  const long long cache_t = timer.GetElapsed();
+  if (page == 0) {
+    _total_render_time = 0;
+  }
+  _total_render_time += cache_t;
   timer.Reset();
 
   // 6. Blit to framebuffer. The buffer is already upscaled to screen_vp size.
@@ -166,18 +171,18 @@ void Viewer::Render() {
               buffer->GetRect(),
               PixelBuffer::Rect(0, 0, screen_size.Width, screen_size.Height));
 
-  const std::string fbrender_str = timer.GetElapsedString();
+  const long long fbrender_t = timer.GetElapsed();
 
   const std::string filt = (
-    _scale_mode == PixelBuffer::ScaleMode::SCALE_NONE ? "None" :
     _scale_mode == PixelBuffer::ScaleMode::SCALE_NEAREST ? "Nearest" :
     _scale_mode == PixelBuffer::ScaleMode::SCALE_BILINEAR ? "Bilinear" :
-    "Bicubic"
+    "None"
   );
   const std::string page_str = "Page: " + std::to_string(page + 1) + " / " + std::to_string(n);
   const std::string filter_str = "Filter: " + filt + (_scale_mode == PixelBuffer::ScaleMode::SCALE_BILINEAR ? " - " + std::to_string(_sharpen_strength) : "");
-  const std::string cache_time_str = "Cache Get: " + cache_str;
-  const std::string fb_time_str = "FB Render: " + fbrender_str;
+  const std::string cache_time_str = "Cache Get: " + std::to_string(cache_t) + "ms";
+  const std::string total_cache_time_str = "Total Time: " + std::to_string(static_cast<float>(_total_render_time)/1000.0f) + "s";
+  const std::string fb_time_str = "FB Render: " + std::to_string(fbrender_t) + "ms";
 
   _fb->DrawText(0, 0, page_str, Framebuffer::TextRenderParams().SetFontSize(32).SetWidth(3));
   _fb->DrawText(0, 40, filter_str, Framebuffer::TextRenderParams().SetFontSize(32).SetWidth(3));

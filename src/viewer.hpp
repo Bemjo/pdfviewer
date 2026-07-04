@@ -166,6 +166,8 @@ class Viewer {
   // Page for which adjacent Prepare() calls were last scheduled.
   int _last_preloaded_page;
 
+  long long _total_render_time;
+
   // Render cache: key is page number, value is the rendered viewport buffer.
   class RenderCache : public Cache<int, std::shared_ptr<PixelBuffer>> {
    public:

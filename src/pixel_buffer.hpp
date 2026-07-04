@@ -61,7 +61,6 @@ class PixelBuffer {
     SCALE_NONE = 0,
     SCALE_NEAREST,
     SCALE_BILINEAR,
-    SCALE_BICUBIC,
     COUNT
   };
 

@@ -183,22 +183,36 @@ void Framebuffer::Render(
   const uint8_t* src_base = src.GetRawBuffer();
   const int src_stride = src.GetAllocatedStrideBytes();
 
+  if (margin_left == 0 && margin_right == 0 &&
+      src_rect.Width * depth == fb_stride &&
+      fb_stride == src_stride) {
+
+      uint8_t* dest_start = fb_base + (dest_rect.Y + margin_top) * fb_stride;
+      const uint8_t* src_start = src.GetRawBuffer() + src_rect.Y * src_stride;
+      size_t total_bytes = src_rect.Height * fb_stride;
+      memcpy(dest_start, src_start, total_bytes);
+
+    } else {
+      for (int y = 0; y < src_rect.Height; ++y) {
+        uint8_t* dest_row = fb_base +
+            (dest_rect.Y + margin_top + y) * fb_stride + dest_rect.X * depth;
+
+        if (margin_left)
+          memset(dest_row, 0, margin_left * depth);
+
+        memcpy(dest_row + margin_left * depth,
+              src_base + (src_rect.Y + y) * src_stride + src_rect.X * depth,
+              src_row_bytes);
+
+        if (margin_right)
+          memset(dest_row + (margin_left + src_rect.Width) * depth,
+                0, margin_right * depth);
+      }
+  }
+
   for (int y = 0; y < margin_top; ++y)
     memset(fb_base + (dest_rect.Y + y) * fb_stride + dest_rect.X * depth,
            0, dest_row_bytes);
-
-  for (int y = 0; y < src_rect.Height; ++y) {
-    uint8_t* dest_row = fb_base +
-        (dest_rect.Y + margin_top + y) * fb_stride + dest_rect.X * depth;
-    if (margin_left)
-      memset(dest_row, 0, margin_left * depth);
-    memcpy(dest_row + margin_left * depth,
-           src_base + (src_rect.Y + y) * src_stride + src_rect.X * depth,
-           src_row_bytes);
-    if (margin_right)
-      memset(dest_row + (margin_left + src_rect.Width) * depth,
-             0, margin_right * depth);
-  }
 
   for (int y = 0; y < margin_bottom; ++y)
     memset(fb_base +
